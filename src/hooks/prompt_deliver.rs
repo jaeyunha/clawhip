@@ -235,6 +235,11 @@ async fn resolve_target_pane(session: &str) -> Result<PaneTarget> {
 fn detect_hook_setup(cwd: &Path) -> Result<HookSetup> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     for directory in cwd.ancestors() {
+        // Do not treat ~/.codex or ~/.claude as project installs; HOME-scoped
+        // hooks are global by convention and are handled by the Global branch
+        // below. Without this break, $HOME would match as a "project root" and
+        // resolve the marker to $HOME/.clawhip/state/... instead of <repo>/...,
+        // and ProviderKind::Omc would never register (only added on Global).
         if home.as_deref() == Some(directory) {
             break;
         }
@@ -1104,6 +1109,18 @@ mod tests {
         assert_eq!(setup.workdir, fake_home);
         assert!(setup.supported_providers.contains(&ProviderKind::Omx));
 
+        let marker = effective_marker_path(&setup, &nested);
+        assert!(
+            marker.starts_with(&nested) || marker.starts_with(&repo),
+            "marker {} must resolve under pane_cwd, not $HOME",
+            marker.display()
+        );
+        assert!(
+            !marker.starts_with(fake_home.join(".clawhip")),
+            "marker must not collapse to $HOME/.clawhip/...; got {}",
+            marker.display()
+        );
+
         if let Some(previous) = previous_home {
             unsafe {
                 std::env::set_var("HOME", previous);
@@ -1155,6 +1172,18 @@ mod tests {
         );
         assert_eq!(setup.workdir, fake_home);
         assert!(setup.supported_providers.contains(&ProviderKind::Omc));
+
+        let marker = effective_marker_path(&setup, &nested);
+        assert!(
+            marker.starts_with(&nested) || marker.starts_with(&repo),
+            "marker {} must resolve under pane_cwd, not $HOME",
+            marker.display()
+        );
+        assert!(
+            !marker.starts_with(fake_home.join(".clawhip")),
+            "marker must not collapse to $HOME/.clawhip/...; got {}",
+            marker.display()
+        );
 
         if let Some(previous) = previous_home {
             unsafe {
