@@ -21,6 +21,26 @@ const CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_COOLDOWN_SECS: u64 = 5;
 const RATE_LIMIT_CAPACITY: u32 = 5;
 const RATE_LIMIT_REFILL_PER_SEC: f64 = 5.0;
+const DISCORD_MAX_CONTENT_LEN: usize = 2000;
+
+fn truncate_for_discord(content: &str) -> std::borrow::Cow<'_, str> {
+    let total = content.chars().count();
+    if total <= DISCORD_MAX_CONTENT_LEN {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    let marker = format!("…[truncated, {total} chars total]");
+    let marker_chars = marker.chars().count();
+    let keep_chars = DISCORD_MAX_CONTENT_LEN.saturating_sub(marker_chars);
+    let cutoff = content
+        .char_indices()
+        .nth(keep_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(content.len());
+    let mut out = String::with_capacity(cutoff + marker.len());
+    out.push_str(&content[..cutoff]);
+    out.push_str(&marker);
+    std::borrow::Cow::Owned(out)
+}
 
 #[derive(Clone)]
 pub struct DiscordClient {
@@ -210,8 +230,9 @@ impl DiscordClient {
             retry_after: None,
         })?;
 
+        let safe = truncate_for_discord(content);
         self.execute_request(
-            client.post(url).json(&json!({ "content": content })),
+            client.post(url).json(&json!({ "content": safe.as_ref() })),
             "Discord API request",
         )
         .await
@@ -222,10 +243,11 @@ impl DiscordClient {
         webhook_url: &str,
         content: &str,
     ) -> std::result::Result<(), DiscordSendError> {
+        let safe = truncate_for_discord(content);
         self.execute_request(
             self.webhook_client
                 .post(webhook_url_with_wait(webhook_url))
-                .json(&json!({ "content": content })),
+                .json(&json!({ "content": safe.as_ref() })),
             "Discord webhook request",
         )
         .await
@@ -423,6 +445,30 @@ mod tests {
             Some(Duration::from_millis(250))
         );
         assert_eq!(parse_retry_after(StatusCode::BAD_REQUEST, "{}"), None);
+    }
+
+    #[test]
+    fn truncate_for_discord_passes_through_short_content() {
+        let s = "hello";
+        let out = truncate_for_discord(s);
+        assert_eq!(out.as_ref(), s);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn truncate_for_discord_clamps_oversized_content_under_limit() {
+        let s: String = std::iter::repeat('x').take(5000).collect();
+        let out = truncate_for_discord(&s);
+        assert!(out.chars().count() <= DISCORD_MAX_CONTENT_LEN);
+        assert!(out.contains("[truncated, 5000 chars total]"));
+    }
+
+    #[test]
+    fn truncate_for_discord_handles_multibyte_chars_safely() {
+        let s: String = std::iter::repeat('가').take(3000).collect();
+        let out = truncate_for_discord(&s);
+        assert!(out.chars().count() <= DISCORD_MAX_CONTENT_LEN);
+        assert!(out.is_char_boundary(out.len() - "[truncated, 3000 chars total]".len()));
     }
 
     #[tokio::test]
