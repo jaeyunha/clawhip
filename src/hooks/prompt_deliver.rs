@@ -233,14 +233,18 @@ async fn resolve_target_pane(session: &str) -> Result<PaneTarget> {
 }
 
 fn detect_hook_setup(cwd: &Path) -> Result<HookSetup> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     for directory in cwd.ancestors() {
+        if home.as_deref() == Some(directory) {
+            break;
+        }
         if let Some(setup) = hook_setup_at(directory, HookDetectionScope::Project) {
             return Ok(setup);
         }
     }
 
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
-        && let Some(setup) = hook_setup_at(&home, HookDetectionScope::Global)
+    if let Some(home) = home.as_ref()
+        && let Some(setup) = hook_setup_at(home, HookDetectionScope::Global)
     {
         return Ok(setup);
     }
@@ -1047,6 +1051,110 @@ mod tests {
 
         let error = detect_hook_setup(&repo).expect_err("old bridge should be rejected");
         assert!(error.to_string().contains("prompt-submit-aware hook setup"));
+
+        if let Some(previous) = previous_home {
+            unsafe {
+                std::env::set_var("HOME", previous);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn detect_hook_setup_skips_home_when_falling_back_to_global_codex() {
+        let tempdir = tempdir().expect("tempdir");
+        let fake_home = tempdir.path().join("home");
+        let repo = fake_home.join("dev/myrepo");
+        let nested = repo.join("src/bin");
+        fs::create_dir_all(fake_home.join(".codex")).expect("create codex dir");
+        fs::create_dir_all(fake_home.join(".clawhip/hooks")).expect("create hook dir");
+        fs::create_dir_all(&nested).expect("create nested dir");
+        let command = format!(
+            "node {} --provider codex",
+            shell_escape_path(&fake_home.join(".clawhip/hooks/native-hook.mjs"))
+        );
+        fs::write(
+            fake_home.join(".codex/hooks.json"),
+            format!(
+                r#"{{"hooks":{{"UserPromptSubmit":[{{"hooks":[{{"type":"command","command":"{command}"}}]}}]}}}}"#
+            ),
+        )
+        .expect("write codex hooks");
+        fs::write(
+            fake_home.join(".clawhip/hooks/native-hook.mjs"),
+            "function maybeWritePromptSubmitState() { return '.clawhip/state/prompt-submit.json'; }\n",
+        )
+        .expect("write native hook");
+
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+        }
+
+        let setup = detect_hook_setup(&nested).expect("hook setup");
+        assert_eq!(
+            setup.install_scope,
+            HookDetectionScope::Global,
+            "ancestor walk must not misclassify HOME as a project root"
+        );
+        assert_eq!(setup.workdir, fake_home);
+        assert!(setup.supported_providers.contains(&ProviderKind::Omx));
+
+        if let Some(previous) = previous_home {
+            unsafe {
+                std::env::set_var("HOME", previous);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn detect_hook_setup_skips_home_when_falling_back_to_global_claude() {
+        let tempdir = tempdir().expect("tempdir");
+        let fake_home = tempdir.path().join("home");
+        let repo = fake_home.join("dev/myrepo");
+        let nested = repo.join("src/bin");
+        fs::create_dir_all(fake_home.join(".claude")).expect("create claude dir");
+        fs::create_dir_all(fake_home.join(".clawhip/hooks")).expect("create hook dir");
+        fs::create_dir_all(&nested).expect("create nested dir");
+        let command = format!(
+            "node {} --provider claude-code",
+            shell_escape_path(&fake_home.join(".clawhip/hooks/native-hook.mjs"))
+        );
+        fs::write(
+            fake_home.join(".claude/settings.json"),
+            format!(
+                r#"{{"hooks":{{"UserPromptSubmit":[{{"hooks":[{{"type":"command","command":"{command}"}}]}}]}}}}"#
+            ),
+        )
+        .expect("write settings");
+        fs::write(
+            fake_home.join(".clawhip/hooks/native-hook.mjs"),
+            "function maybeWritePromptSubmitState() { return '.clawhip/state/prompt-submit.json'; }\n",
+        )
+        .expect("write native hook");
+
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+        }
+
+        let setup = detect_hook_setup(&nested).expect("hook setup");
+        assert_eq!(
+            setup.install_scope,
+            HookDetectionScope::Global,
+            "ancestor walk must not misclassify HOME as a project root"
+        );
+        assert_eq!(setup.workdir, fake_home);
+        assert!(setup.supported_providers.contains(&ProviderKind::Omc));
 
         if let Some(previous) = previous_home {
             unsafe {
