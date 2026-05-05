@@ -21,3 +21,14 @@ Daemon-first event gateway for Discord. Routes GitHub, tmux, and custom events t
 - New dependencies must be justified — prefer std library where possible.
 - Daemon lifecycle: verify clean shutdown and signal handling.
 - Test coverage: flag new logic paths that lack corresponding tests.
+
+
+## Project memory layer
+
+This repo uses the clawhip filesystem-offloaded memory pattern.
+
+- On session start: read `MEMORY.md` (small index).
+- Follow it to the relevant shard under `memory/` for context (project, channel, agent, today's daily).
+- During work: append findings/decisions to the appropriate shard.
+- At session end: update today's `memory/daily/<YYYY-MM-DD>.md` with a brief log.
+- These files are gitignored — they are local session state, not committed history.
