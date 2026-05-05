@@ -98,7 +98,7 @@ pub async fn run(
     let ci_batch_window = config.dispatch.ci_batch_window();
     let routine_batch_window = config.dispatch.routine_batch_window();
     let dispatcher_native_observability = native_observability.clone();
-    tokio::spawn(async move {
+    let dispatcher_handle = tokio::spawn(async move {
         let mut dispatcher = Dispatcher::new(
             rx,
             router,
@@ -108,9 +108,7 @@ pub async fn run(
             routine_batch_window,
             dispatcher_native_observability,
         );
-        if let Err(error) = dispatcher.run().await {
-            eprintln!("clawhip dispatcher stopped: {error}");
-        }
+        dispatcher.run().await
     });
     spawn_source(GitSource::new(config.clone()), tx.clone());
     spawn_source(GitHubSource::new(config.clone()), tx.clone());
@@ -171,8 +169,17 @@ pub async fn run(
         telemetry::reason::DAEMON_LISTENING,
         json!({"version": VERSION, "addr": local_addr.to_string(), "token_source": token_source}),
     ));
-    axum::serve(listener, app).await?;
-    Ok(())
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            result?;
+            Ok(())
+        }
+        join = dispatcher_handle => match join {
+            Ok(Ok(())) => Err("clawhip dispatcher exited unexpectedly; restarting daemon".into()),
+            Ok(Err(error)) => Err(format!("clawhip dispatcher stopped: {error}").into()),
+            Err(error) => Err(format!("clawhip dispatcher panicked: {error}").into()),
+        },
+    }
 }
 
 fn spawn_source<S>(source: S, tx: mpsc::Sender<IncomingEvent>)
