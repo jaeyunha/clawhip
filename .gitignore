@@ -5,3 +5,5 @@ target/
 .omx/
 .claude/worktrees/
 .clawhip/state/
+MEMORY.md
+memory/
