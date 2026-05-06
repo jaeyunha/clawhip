@@ -11,10 +11,13 @@ use crate::cli::DeliverArgs;
 use crate::source::tmux::{content_hash, tmux_bin};
 
 pub const DEFAULT_MAX_ENTERS: u32 = 4;
+pub const DEFAULT_READY_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_TUI_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_VERIFY_DELAY: Duration = Duration::from_millis(350);
 const DEFAULT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(4);
+const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(DEFAULT_READY_TIMEOUT_SECS);
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PROMPT_SUBMIT_MARKER: &str = ".clawhip/state/prompt-submit.json";
 const NATIVE_HOOK_SCRIPT: &str = ".clawhip/hooks/native-hook.mjs";
 const PROMPT_CHARS: &[char] = &['$', '%', '>', '#', '❯', '›'];
@@ -30,6 +33,7 @@ pub struct PromptDeliverConfig {
     pub poll_interval: Duration,
     pub verify_delay: Duration,
     pub progress_timeout: Duration,
+    pub ready_timeout: Duration,
 }
 
 impl PromptDeliverConfig {
@@ -42,6 +46,7 @@ impl PromptDeliverConfig {
             poll_interval: DEFAULT_POLL_INTERVAL,
             verify_delay: DEFAULT_VERIFY_DELAY,
             progress_timeout: DEFAULT_PROGRESS_TIMEOUT,
+            ready_timeout: DEFAULT_READY_TIMEOUT,
         }
     }
 }
@@ -56,6 +61,7 @@ impl From<DeliverArgs> for PromptDeliverConfig {
             poll_interval: DEFAULT_POLL_INTERVAL,
             verify_delay: DEFAULT_VERIFY_DELAY,
             progress_timeout: DEFAULT_PROGRESS_TIMEOUT,
+            ready_timeout: Duration::from_secs(value.ready_timeout_secs),
         }
     }
 }
@@ -132,13 +138,19 @@ pub async fn run(args: DeliverArgs) -> Result<()> {
 }
 
 pub async fn deliver(config: &PromptDeliverConfig) -> Result<DeliveryResult> {
-    let mut pane = resolve_target_pane(&config.session).await?;
-    let hook_setup = detect_hook_setup(&pane.cwd)?;
-    let provider = ensure_provider_ready(&mut pane, &hook_setup, config).await?;
+    let ReadyState {
+        mut pane,
+        hook_setup,
+        provider,
+    } = wait_until_pane_ready(config).await?;
     let marker_path = effective_marker_path(&hook_setup, &pane.cwd);
     let effective_workdir = effective_workdir(&hook_setup, &pane.cwd);
 
+    // wait_until_pane_ready guarantees a resolved pane and provider, but the
+    // provider's prompt UI may still be redrawing. Give the TUI a short grace
+    // window so the first Enter doesn't land mid-render.
     wait_for_tui_ready(&pane.pane_id, config.tui_timeout, config.poll_interval).await?;
+    let _ = &mut pane;
 
     let baseline_marker = read_marker_hash(&marker_path)?;
     if hook_setup.install_scope == HookDetectionScope::Global {
@@ -182,6 +194,126 @@ pub async fn deliver(config: &PromptDeliverConfig) -> Result<DeliveryResult> {
         format_last_line(&last_line),
     )
     .into())
+}
+
+struct ReadyState {
+    pane: PaneTarget,
+    hook_setup: HookSetup,
+    provider: ProviderKind,
+}
+
+/// Poll the existing readiness chain (tmux pane resolve → hook detect →
+/// provider detect/resume) until every stage succeeds or `config.ready_timeout`
+/// elapses. The first stage that is still failing at the deadline shapes the
+/// unified error.
+///
+/// This collapses three historically-distinct boot-race failures —
+/// `tmux did not return an active pane`, `multiple providers configured for
+/// this workdir`, and "no active Codex/Claude pane" — into one timeout error
+/// that names which precondition was unsatisfied at deadline.
+async fn wait_until_pane_ready(config: &PromptDeliverConfig) -> Result<ReadyState> {
+    let deadline = tokio::time::Instant::now() + config.ready_timeout;
+    let mut last_failure = ReadinessFailure::pending("target-pane");
+    let mut first = true;
+
+    loop {
+        match try_resolve_ready(config, &mut last_failure).await {
+            Ok(state) => return Ok(state),
+            Err(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(last_failure.into_error(config).into());
+                }
+                if first {
+                    first = false;
+                } else {
+                    sleep(READY_POLL_INTERVAL).await;
+                }
+            }
+        }
+    }
+}
+
+async fn try_resolve_ready(
+    config: &PromptDeliverConfig,
+    last_failure: &mut ReadinessFailure,
+) -> Result<ReadyState> {
+    let mut pane = match resolve_target_pane(&config.session).await {
+        Ok(pane) => pane,
+        Err(err) => {
+            *last_failure = ReadinessFailure::new("target-pane", err.to_string(), None);
+            return Err("target-pane".into());
+        }
+    };
+    let hook_setup = match detect_hook_setup(&pane.cwd) {
+        Ok(setup) => setup,
+        Err(err) => {
+            *last_failure =
+                ReadinessFailure::new("hook-registration", err.to_string(), Some(pane.clone()));
+            return Err("hook-registration".into());
+        }
+    };
+    let provider = match ensure_provider_ready(&mut pane, &hook_setup, config).await {
+        Ok(provider) => provider,
+        Err(err) => {
+            *last_failure =
+                ReadinessFailure::new("active-provider", err.to_string(), Some(pane.clone()));
+            return Err("active-provider".into());
+        }
+    };
+
+    Ok(ReadyState {
+        pane,
+        hook_setup,
+        provider,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ReadinessFailure {
+    failed_precondition: &'static str,
+    detail: String,
+    pane: Option<PaneTarget>,
+}
+
+impl ReadinessFailure {
+    fn pending(precondition: &'static str) -> Self {
+        Self {
+            failed_precondition: precondition,
+            detail: "deadline reached before any check returned a verdict".to_string(),
+            pane: None,
+        }
+    }
+
+    fn new(precondition: &'static str, detail: String, pane: Option<PaneTarget>) -> Self {
+        Self {
+            failed_precondition: precondition,
+            detail,
+            pane,
+        }
+    }
+
+    fn into_error(self, config: &PromptDeliverConfig) -> String {
+        let mut parts = vec![
+            format!(
+                "refusing delivery: pane not ready within {:?}",
+                config.ready_timeout
+            ),
+            format!("session={}", config.session),
+            format!("failed_precondition={}", self.failed_precondition),
+            format!("last_check={}", self.detail),
+        ];
+        if let Some(pane) = self.pane {
+            parts.push(format!("pane={}", pane.pane_id));
+            parts.push(format!("cwd={}", pane.cwd.display()));
+            let cmd = if pane.current_command.is_empty() {
+                "<unknown>".to_string()
+            } else {
+                pane.current_command
+            };
+            parts.push(format!("observed_command={cmd}"));
+        }
+        parts.join("; ")
+    }
 }
 
 async fn resolve_target_pane(session: &str) -> Result<PaneTarget> {
@@ -871,6 +1003,51 @@ mod tests {
         assert_eq!(config.poll_interval, Duration::from_millis(500));
         assert_eq!(config.verify_delay, Duration::from_millis(350));
         assert_eq!(config.progress_timeout, Duration::from_secs(4));
+        assert_eq!(config.ready_timeout, DEFAULT_READY_TIMEOUT);
+    }
+
+    #[test]
+    fn readiness_failure_message_names_failed_precondition() {
+        let config = PromptDeliverConfig::new("forever-agent-staging-fix".into(), "hi".into());
+        let failure = ReadinessFailure::new(
+            "target-pane",
+            "tmux did not return an active pane".to_string(),
+            None,
+        );
+        let msg = failure.into_error(&config);
+        assert!(
+            msg.contains("session=forever-agent-staging-fix"),
+            "expected session in {msg}"
+        );
+        assert!(
+            msg.contains("failed_precondition=target-pane"),
+            "expected precondition tag in {msg}"
+        );
+        assert!(
+            msg.contains("pane not ready within"),
+            "expected timeout phrasing in {msg}"
+        );
+    }
+
+    #[test]
+    fn readiness_failure_message_includes_pane_when_known() {
+        let config = PromptDeliverConfig::new("dev".into(), "hi".into());
+        let pane = PaneTarget {
+            session: "dev".into(),
+            pane_id: "%42".into(),
+            pane_pid: 100,
+            current_command: "zsh".into(),
+            cwd: PathBuf::from("/tmp/work"),
+        };
+        let failure =
+            ReadinessFailure::new("active-provider", "no provider running".into(), Some(pane));
+        let msg = failure.into_error(&config);
+        assert!(msg.contains("pane=%42"), "expected pane in {msg}");
+        assert!(msg.contains("cwd=/tmp/work"), "expected cwd in {msg}");
+        assert!(
+            msg.contains("observed_command=zsh"),
+            "expected observed_command in {msg}"
+        );
     }
 
     #[test]
@@ -1321,6 +1498,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
             verify_delay: Duration::from_millis(10),
             progress_timeout: Duration::from_millis(30),
+            ready_timeout: Duration::from_millis(200),
         };
 
         let error = deliver(&config)
@@ -1408,6 +1586,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
             verify_delay: Duration::from_millis(10),
             progress_timeout: Duration::from_millis(40),
+            ready_timeout: Duration::from_millis(200),
         };
 
         let result = deliver(&config).await.expect("deliver");

@@ -9,6 +9,8 @@ use crate::events::MessageFormat;
 pub const DEFAULT_RETRY_ENTER_COUNT: u32 = 4;
 pub const DEFAULT_RETRY_ENTER_DELAY_MS: u64 = 250;
 pub const DEFAULT_DELIVER_MAX_ENTERS: u32 = crate::hooks::prompt_deliver::DEFAULT_MAX_ENTERS;
+pub const DEFAULT_DELIVER_READY_TIMEOUT_SECS: u64 =
+    crate::hooks::prompt_deliver::DEFAULT_READY_TIMEOUT_SECS;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -160,6 +162,11 @@ pub struct DeliverArgs {
     /// Maximum Enter presses to attempt before failing.
     #[arg(long, default_value_t = DEFAULT_DELIVER_MAX_ENTERS)]
     pub max_enters: u32,
+    /// Seconds to wait for the target pane to reach a provider-prompt-ready
+    /// state (tmux pane resolvable, hooks installed, single matching provider
+    /// process running, prompt UI rendered) before giving up.
+    #[arg(long, default_value_t = DEFAULT_DELIVER_READY_TIMEOUT_SECS)]
+    pub ready_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Args)]
