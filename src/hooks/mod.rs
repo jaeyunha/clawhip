@@ -294,6 +294,12 @@ mod tests {
             std::env::set_var("HOME", dir.path());
         }
 
+        // run_install canonicalizes the install root (resolve_install_root),
+        // which on macOS rewrites /var/folders/... -> /private/var/folders/...
+        // Compare against the canonicalized form so the test does not depend on
+        // the platform's symlink layout for tempdir.
+        let canonical = dir.path().canonicalize().expect("canonicalize tempdir");
+
         let report = run_install(&HooksInstallArgs {
             all: false,
             provider: vec![HookProvider::Codex],
@@ -303,6 +309,10 @@ mod tests {
         })
         .expect("project-scoped codex install should succeed");
 
+        // The global hook script lives under home_dir() (non-canonical: just
+        // PathBuf::from($HOME)), but the per-project codex hooks file path
+        // comes from resolve_install_root() which canonicalizes. The two
+        // generated paths therefore root at different forms of the same dir.
         assert!(
             report
                 .generated_files
@@ -311,12 +321,7 @@ mod tests {
         assert!(
             report
                 .generated_files
-                .contains(&dir.path().join(CODEX_HOOKS_FILE))
-        );
-        assert!(
-            report
-                .generated_files
-                .contains(&dir.path().join(CODEX_HOOKS_FILE))
+                .contains(&canonical.join(CODEX_HOOKS_FILE))
         );
 
         if let Some(previous) = previous_home {

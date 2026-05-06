@@ -641,12 +641,24 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         git(&worktree, &["checkout", "-b", "feat/issue-115-v2"]).await;
+        // payload["repo_path"] is the raw config input (repo.path.clone()),
+        // which equals path_str(&root). payload["worktree_path"] comes from
+        // `git worktree list --porcelain` output which always canonicalizes,
+        // so on macOS the linked worktree path arrives as /private/var/...
+        // while sandbox.path() is /var/.... Compare each side accordingly.
+        let canonical_worktree =
+            std::fs::canonicalize(&worktree).expect("canonicalize linked worktree");
+        let canonical_worktree = canonical_worktree.to_string_lossy();
+
         poll_git(&config, &tx, &mut state).await.unwrap();
         let branch_event = rx.try_recv().unwrap();
         assert_eq!(branch_event.kind, "git.branch-changed");
         assert_eq!(branch_event.payload["repo"], "clawhip");
         assert_eq!(branch_event.payload["repo_path"], path_str(&root));
-        assert_eq!(branch_event.payload["worktree_path"], path_str(&worktree));
+        assert_eq!(
+            branch_event.payload["worktree_path"],
+            canonical_worktree.as_ref()
+        );
         assert_eq!(branch_event.payload["old_branch"], "feat/issue-115");
         assert_eq!(branch_event.payload["new_branch"], "feat/issue-115-v2");
         assert!(rx.try_recv().is_err());
@@ -660,7 +672,10 @@ mod tests {
         assert_eq!(commit_event.kind, "git.commit");
         assert_eq!(commit_event.payload["repo"], "clawhip");
         assert_eq!(commit_event.payload["repo_path"], path_str(&root));
-        assert_eq!(commit_event.payload["worktree_path"], path_str(&worktree));
+        assert_eq!(
+            commit_event.payload["worktree_path"],
+            canonical_worktree.as_ref()
+        );
         assert_eq!(commit_event.payload["branch"], "feat/issue-115-v2");
         assert_eq!(commit_event.payload["summary"], "worktree commit");
         assert!(rx.try_recv().is_err());

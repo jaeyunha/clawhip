@@ -807,10 +807,14 @@ mod tests {
 
         let monitor_args = TmuxMonitorArgs::from_new_args(&args, &config);
 
+        // routing_metadata_for_cwd canonicalizes the cwd, which on macOS
+        // turns /var/folders/... into /private/var/folders/.... Compare
+        // against the canonicalized form rather than the raw tempdir path.
+        let canonical_repo = std::fs::canonicalize(repo.path()).expect("canonicalize repo path");
         assert_eq!(monitor_args.channel.as_deref(), Some("metadata-route"));
         assert_eq!(
             monitor_args.routing.worktree_path.as_deref(),
-            Some(repo.path().to_string_lossy().as_ref())
+            Some(canonical_repo.to_string_lossy().as_ref())
         );
         assert!(monitor_args.routing.repo_name.is_some());
     }
