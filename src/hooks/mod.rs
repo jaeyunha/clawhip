@@ -301,6 +301,10 @@ mod tests {
         })
         .expect("project-scoped codex install should succeed");
 
+        // The global hook script lives under home_dir() (non-canonical: just
+        // PathBuf::from($HOME)), but the per-project codex hooks file path
+        // comes from resolve_install_root() which canonicalizes. The two
+        // generated paths therefore root at different forms of the same dir.
         assert!(
             report
                 .generated_files

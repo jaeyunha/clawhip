@@ -264,8 +264,7 @@ async fn try_resolve_ready(
     let effective_workdir = match effective_workdir(&hook_setup, &pane.cwd) {
         Ok(workdir) => workdir,
         Err(err) => {
-            *last_failure =
-                ReadinessFailure::new("workdir", err.to_string(), Some(pane.clone()));
+            *last_failure = ReadinessFailure::new("workdir", err.to_string(), Some(pane.clone()));
             return Err("workdir".into());
         }
     };
@@ -1303,11 +1302,12 @@ mod tests {
         assert_eq!(setup.workdir, fake_home);
         assert!(setup.supported_providers.contains(&ProviderKind::Omx));
 
+        let canonical_repo = repo.canonicalize().expect("canonicalize repo");
         let marker = effective_workdir(&setup, &nested)
             .expect("effective workdir")
             .join(PROMPT_SUBMIT_MARKER);
         assert!(
-            marker.starts_with(&nested) || marker.starts_with(&repo),
+            marker.starts_with(&canonical_repo),
             "marker {} must resolve under pane_cwd, not $HOME",
             marker.display()
         );
@@ -1370,11 +1370,12 @@ mod tests {
         assert_eq!(setup.workdir, fake_home);
         assert!(setup.supported_providers.contains(&ProviderKind::Omc));
 
+        let canonical_repo = repo.canonicalize().expect("canonicalize repo");
         let marker = effective_workdir(&setup, &nested)
             .expect("effective workdir")
             .join(PROMPT_SUBMIT_MARKER);
         assert!(
-            marker.starts_with(&nested) || marker.starts_with(&repo),
+            marker.starts_with(&canonical_repo),
             "marker {} must resolve under pane_cwd, not $HOME",
             marker.display()
         );
