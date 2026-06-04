@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn truncate_for_discord_clamps_oversized_content_under_limit() {
-        let s: String = std::iter::repeat('x').take(5000).collect();
+        let s = "x".repeat(5000);
         let out = truncate_for_discord(&s);
         assert!(out.chars().count() <= DISCORD_MAX_CONTENT_LEN);
         assert!(out.contains("[truncated, 5000 chars total]"));
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn truncate_for_discord_handles_multibyte_chars_safely() {
-        let s: String = std::iter::repeat('가').take(3000).collect();
+        let s = "가".repeat(3000);
         let out = truncate_for_discord(&s);
         assert!(out.chars().count() <= DISCORD_MAX_CONTENT_LEN);
         assert!(out.is_char_boundary(out.len() - "[truncated, 3000 chars total]".len()));
