@@ -4,8 +4,8 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::event::{
-    AgentEvent, CustomEvent, EventBody, EventEnvelope, EventMetadata, EventPriority,
-    GitBranchChangedEvent, GitCommitAggregatedEvent, GitCommitEvent, GitHubCIEvent,
+    AgentEvent, CustomEvent, DiscordNudgeIntentEvent, EventBody, EventEnvelope, EventMetadata,
+    EventPriority, GitBranchChangedEvent, GitCommitAggregatedEvent, GitCommitEvent, GitHubCIEvent,
     GitHubIssueEvent, GitHubPREvent, GitHubPRStatusEvent, GitHubReleaseEvent,
     TmuxKeywordAggregatedEvent, TmuxKeywordEvent, TmuxStaleEvent, WorkspaceEvent,
 };
@@ -65,6 +65,30 @@ fn body_for(kind: &str, payload: &Value) -> Result<EventBody> {
         "github.release-edited" => Ok(EventBody::GitHubReleaseEdited(github_release_event(
             payload,
         )?)),
+        "discord.message-create" => Ok(EventBody::DiscordMessageCreate(serde_json::from_value(
+            payload.clone(),
+        )?)),
+        "discord-watch.nudge-intent" => Ok(EventBody::DiscordWatchNudgeIntent(
+            DiscordNudgeIntentEvent {
+                intent_id: string_field(payload, "id")?,
+                reasons: payload
+                    .get("reasons")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                content: string_field(payload, "content")?,
+                local_only: payload
+                    .get("local_only")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            },
+        )),
         "github.ci-failed" => Ok(EventBody::GitHubCIFailed(GitHubCIEvent {
             repo: string_field(payload, "repo")?,
             number: payload.get("number").and_then(Value::as_u64),
@@ -304,12 +328,6 @@ fn agent_event(payload: &Value) -> Result<AgentEvent> {
         pr_url: optional_string_field(payload, "pr_url"),
         command: optional_string_field(payload, "command"),
         tool_name: optional_string_field(payload, "tool_name"),
-        tmux_session: optional_string_field(payload, "tmux_session"),
-        tmux_window: optional_string_field(payload, "tmux_window"),
-        tmux_pane: optional_string_field(payload, "tmux_pane"),
-        tmux_pane_tty: optional_string_field(payload, "tmux_pane_tty"),
-        tmux_attached: payload.get("tmux_attached").and_then(Value::as_bool),
-        tmux_client_count: payload.get("tmux_client_count").and_then(Value::as_u64),
         elapsed_secs: payload.get("elapsed_secs").and_then(Value::as_u64),
         summary: optional_string_field(payload, "summary"),
         error_summary: optional_string_field(payload, "error_summary")
@@ -702,12 +720,6 @@ mod tests {
             "pr_url": "https://github.com/Yeachan-Heo/clawhip/pull/72",
             "command": "cargo test",
             "tool_name": "Bash",
-            "tmux_session": "issue-65",
-            "tmux_window": "1",
-            "tmux_pane": "%42",
-            "tmux_pane_tty": "/dev/pts/9",
-            "tmux_attached": true,
-            "tmux_client_count": 2,
             "elapsed_secs": 42,
             "summary": "summary",
             "error_summary": "error summary",
@@ -730,12 +742,6 @@ mod tests {
             pr_url: Some("https://github.com/Yeachan-Heo/clawhip/pull/72".into()),
             command: Some("cargo test".into()),
             tool_name: Some("Bash".into()),
-            tmux_session: Some("issue-65".into()),
-            tmux_window: Some("1".into()),
-            tmux_pane: Some("%42".into()),
-            tmux_pane_tty: Some("/dev/pts/9".into()),
-            tmux_attached: Some(true),
-            tmux_client_count: Some(2),
             elapsed_secs: Some(42),
             summary: Some("summary".into()),
             error_summary: Some("error summary".into()),

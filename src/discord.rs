@@ -14,6 +14,7 @@ use crate::core::circuit_breaker::CircuitBreaker;
 use crate::core::dlq::{Dlq, DlqEntry};
 use crate::core::rate_limit::RateLimiter;
 use crate::sink::{SinkMessage, SinkTarget};
+use crate::telemetry;
 
 const MAX_ATTEMPTS: u32 = 3;
 const JITTER_MS: u64 = 50;
@@ -61,6 +62,7 @@ struct DiscordState {
 struct DiscordSendError {
     message: String,
     retry_after: Option<Duration>,
+    status: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,8 +112,24 @@ impl DiscordClient {
 
     pub async fn send(&self, target: &SinkTarget, message: &SinkMessage) -> Result<()> {
         let key = target_rate_limit_key(target);
-        if !self.allow_request(&key) {
-            let error = format!("Discord circuit open for {key}");
+        let safe_target = telemetry::safe_target_id(target);
+        let telemetry_ctx = telemetry::TelemetryContext::from_message(message);
+        let (allowed, transition) = self.allow_request(&key);
+        if let Some(transition) = transition {
+            self.emit_circuit_transition(&telemetry_ctx.correlation_id, &safe_target, &transition);
+        }
+        if !allowed {
+            telemetry::emit(discord_record(DiscordTelemetryInput {
+                event_name: telemetry::event_name::DISCORD_SEND_FAILURE,
+                reason_code: telemetry::reason::CIRCUIT_OPEN,
+                correlation_id: &telemetry_ctx.correlation_id,
+                safe_target: &safe_target,
+                message,
+                attempt: Some(MAX_ATTEMPTS),
+                error: Some("circuit-open".to_string()),
+                status: None,
+            }));
+            let error = format!("Discord circuit open for {safe_target}");
             self.record_dlq(target, message, MAX_ATTEMPTS, error.clone());
             return Err(error.into());
         }
@@ -121,10 +139,23 @@ impl DiscordClient {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
+            telemetry::emit(discord_record(DiscordTelemetryInput {
+                event_name: telemetry::event_name::DISCORD_SEND_ATTEMPT,
+                reason_code: telemetry::reason::DISCORD_PRE_SEND,
+                correlation_id: &telemetry_ctx.correlation_id,
+                safe_target: &safe_target,
+                message,
+                attempt: Some(attempt),
+                error: None,
+                status: None,
+            }));
 
             let result = match target {
                 SinkTarget::DiscordChannel(channel_id) => {
                     self.send_message(channel_id, &message.content).await
+                }
+                SinkTarget::DiscordThread(thread_id) => {
+                    self.send_thread_message(thread_id, &message.content).await
                 }
                 SinkTarget::DiscordWebhook(webhook_url) => {
                     self.send_webhook(webhook_url, &message.content).await
@@ -132,29 +163,74 @@ impl DiscordClient {
                 SinkTarget::SlackWebhook(_) => {
                     return Err("cannot send Slack webhook via Discord client".into());
                 }
+                SinkTarget::LocalFile(_) => {
+                    return Err("cannot send localfile target via Discord client".into());
+                }
             };
 
             match result {
                 Ok(()) => {
-                    self.record_success(&key);
+                    if let Some(transition) = self.record_success(&key) {
+                        self.emit_circuit_transition(
+                            &telemetry_ctx.correlation_id,
+                            &safe_target,
+                            &transition,
+                        );
+                    }
+                    telemetry::emit(discord_record(DiscordTelemetryInput {
+                        event_name: telemetry::event_name::DISCORD_SEND_SUCCESS,
+                        reason_code: telemetry::reason::DISCORD_SUCCESS,
+                        correlation_id: &telemetry_ctx.correlation_id,
+                        safe_target: &safe_target,
+                        message,
+                        attempt: Some(attempt),
+                        error: None,
+                        status: None,
+                    }));
                     return Ok(());
                 }
                 Err(error) => {
-                    self.record_failure(&key);
+                    if let Some(transition) = self.record_failure(&key) {
+                        self.emit_circuit_transition(
+                            &telemetry_ctx.correlation_id,
+                            &safe_target,
+                            &transition,
+                        );
+                    }
                     if let Some(retry_after) = error.retry_after
                         && attempt < MAX_ATTEMPTS
                     {
+                        telemetry::emit(discord_record(DiscordTelemetryInput {
+                            event_name: telemetry::event_name::DISCORD_SEND_FAILURE,
+                            reason_code: telemetry::reason::DISCORD_RETRY,
+                            correlation_id: &telemetry_ctx.correlation_id,
+                            safe_target: &safe_target,
+                            message,
+                            attempt: Some(attempt),
+                            error: Some(error.message.clone()),
+                            status: error.status,
+                        }));
                         tokio::time::sleep(retry_after + jitter_for_attempt(attempt)).await;
                         continue;
                     }
 
+                    telemetry::emit(discord_record(DiscordTelemetryInput {
+                        event_name: telemetry::event_name::DISCORD_SEND_FAILURE,
+                        reason_code: telemetry::reason::DISCORD_EXHAUSTED,
+                        correlation_id: &telemetry_ctx.correlation_id,
+                        safe_target: &safe_target,
+                        message,
+                        attempt: Some(attempt),
+                        error: Some(error.message.clone()),
+                        status: error.status,
+                    }));
                     self.record_dlq(target, message, attempt, error.message.clone());
                     return Err(error.message.into());
                 }
             }
         }
 
-        let error = format!("Discord delivery exhausted retries for {key}");
+        let error = format!("Discord delivery exhausted retries for {safe_target}");
         self.record_dlq(target, message, MAX_ATTEMPTS, error.clone());
         Err(error.into())
     }
@@ -228,12 +304,36 @@ impl DiscordClient {
         let client = self.bot_client.as_ref().ok_or_else(|| DiscordSendError {
             message: "missing Discord bot token for channel delivery; configure [providers.discord].token (or legacy [discord].token) or use a route webhook".to_string(),
             retry_after: None,
+            status: None,
         })?;
 
         let safe = truncate_for_discord(content);
         self.execute_request(
             client.post(url).json(&json!({ "content": safe.as_ref() })),
             "Discord API request",
+        )
+        .await
+    }
+
+    async fn send_thread_message(
+        &self,
+        thread_id: &str,
+        content: &str,
+    ) -> std::result::Result<(), DiscordSendError> {
+        let url = format!(
+            "{}/channels/{}/messages",
+            self.api_base.trim_end_matches('/'),
+            thread_id
+        );
+        let client = self.bot_client.as_ref().ok_or_else(|| DiscordSendError {
+            message: "missing Discord bot token for thread delivery; configure [providers.discord].token (or legacy [discord].token) or use a channel/webhook route".to_string(),
+            retry_after: None,
+            status: None,
+        })?;
+
+        self.execute_request(
+            client.post(url).json(&json!({ "content": content })),
+            "Discord thread request",
         )
         .await
     }
@@ -258,9 +358,10 @@ impl DiscordClient {
         request: reqwest::RequestBuilder,
         label: &str,
     ) -> std::result::Result<(), DiscordSendError> {
-        let response = request.send().await.map_err(|error| DiscordSendError {
-            message: format!("{label} failed: {error}"),
+        let response = request.send().await.map_err(|_error| DiscordSendError {
+            message: format!("{label} failed: transport error"),
             retry_after: None,
+            status: None,
         })?;
 
         if response.status().is_success() {
@@ -269,13 +370,25 @@ impl DiscordClient {
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
+        let message = if label == "Discord thread request" {
+            discord_thread_error_message(status)
+        } else {
+            format!("{label} failed with {status}: {body}")
+        };
         Err(DiscordSendError {
-            message: format!("{label} failed with {status}: {body}"),
+            message,
             retry_after: parse_retry_after(status, &body),
+            status: Some(status.as_u16()),
         })
     }
 
-    fn allow_request(&self, key: &str) -> bool {
+    fn allow_request(
+        &self,
+        key: &str,
+    ) -> (
+        bool,
+        Option<crate::core::circuit_breaker::CircuitTransition>,
+    ) {
         let mut state = self.state.lock().expect("discord state lock");
         state
             .circuits
@@ -294,7 +407,7 @@ impl DiscordClient {
         state.limiter.delay_for(key)
     }
 
-    fn record_success(&self, key: &str) {
+    fn record_success(&self, key: &str) -> Option<crate::core::circuit_breaker::CircuitTransition> {
         let mut state = self.state.lock().expect("discord state lock");
         state
             .circuits
@@ -305,10 +418,10 @@ impl DiscordClient {
                     Duration::from_secs(CIRCUIT_COOLDOWN_SECS),
                 )
             })
-            .record_success();
+            .record_success()
     }
 
-    fn record_failure(&self, key: &str) {
+    fn record_failure(&self, key: &str) -> Option<crate::core::circuit_breaker::CircuitTransition> {
         let mut state = self.state.lock().expect("discord state lock");
         state
             .circuits
@@ -319,20 +432,54 @@ impl DiscordClient {
                     Duration::from_secs(CIRCUIT_COOLDOWN_SECS),
                 )
             })
-            .record_failure();
+            .record_failure()
+    }
+
+    fn emit_circuit_transition(
+        &self,
+        correlation_id: &str,
+        safe_target: &str,
+        transition: &crate::core::circuit_breaker::CircuitTransition,
+    ) {
+        let mut record = telemetry::record(
+            telemetry::event_name::CIRCUIT_TRANSITION,
+            telemetry::reason::CIRCUIT_TRANSITION,
+            correlation_id.to_string(),
+        );
+        record.insert("target".to_string(), json!(safe_target));
+        record.insert("from".to_string(), json!(transition.from));
+        record.insert("to".to_string(), json!(transition.to));
+        telemetry::emit(record);
     }
 
     fn record_dlq(&self, target: &SinkTarget, message: &SinkMessage, attempts: u32, error: String) {
+        let safe_target = telemetry::safe_target_id(target);
+        let correlation_id =
+            telemetry::correlation_id_for_message(&message.event_kind, &message.payload);
         let entry = DlqEntry {
             original_topic: message.event_kind.clone(),
             retry_count: attempts,
             last_error: error,
-            target: target_rate_limit_key(target),
+            target: safe_target.clone(),
             event_kind: message.event_kind.clone(),
             format: message.format.as_str().to_string(),
             content: message.content.clone(),
             payload: message.payload.clone(),
+            correlation_id: Some(correlation_id.clone()),
+            content_bytes: Some(message.content.len()),
+            payload_bytes: telemetry::payload_bytes(&message.payload),
         };
+
+        telemetry::emit(discord_record(DiscordTelemetryInput {
+            event_name: telemetry::event_name::DLQ_BURY,
+            reason_code: telemetry::reason::DLQ_WRITE,
+            correlation_id: &correlation_id,
+            safe_target: &safe_target,
+            message,
+            attempt: Some(attempts),
+            error: Some(entry.last_error.clone()),
+            status: None,
+        }));
 
         eprintln!(
             "clawhip dlq bury: {}",
@@ -394,12 +541,71 @@ fn parse_retry_after(status: StatusCode, body: &str) -> Option<Duration> {
         .map(Duration::from_secs_f64)
 }
 
+fn discord_thread_error_message(status: StatusCode) -> String {
+    let detail = match status {
+        StatusCode::BAD_REQUEST => "thread may be archived or not writable by the bot",
+        StatusCode::FORBIDDEN => "thread is unreachable by the bot",
+        StatusCode::NOT_FOUND => "thread is missing or unreachable by the bot",
+        StatusCode::UNAUTHORIZED => "Discord bot token is invalid for thread delivery",
+        StatusCode::TOO_MANY_REQUESTS => "Discord rate limited thread delivery",
+        _ => "thread delivery failed",
+    };
+    format!("Discord thread delivery failed with {status}: {detail}")
+}
+
 fn target_rate_limit_key(target: &SinkTarget) -> String {
     match target {
         SinkTarget::DiscordChannel(channel_id) => format!("discord:channel:{channel_id}"),
+        SinkTarget::DiscordThread(thread_id) => format!("discord:thread:{thread_id}"),
         SinkTarget::DiscordWebhook(webhook_url) => format!("discord:webhook:{webhook_url}"),
         SinkTarget::SlackWebhook(webhook_url) => format!("slack:webhook:{webhook_url}"),
+        SinkTarget::LocalFile(path) => format!("localfile:{path}"),
     }
+}
+
+struct DiscordTelemetryInput<'a> {
+    event_name: &'a str,
+    reason_code: &'a str,
+    correlation_id: &'a str,
+    safe_target: &'a str,
+    message: &'a SinkMessage,
+    attempt: Option<u32>,
+    error: Option<String>,
+    status: Option<u16>,
+}
+
+fn discord_record(input: DiscordTelemetryInput<'_>) -> serde_json::Map<String, serde_json::Value> {
+    let mut record = telemetry::record(
+        input.event_name,
+        input.reason_code,
+        input.correlation_id.to_string(),
+    );
+    record.insert("target".to_string(), json!(input.safe_target));
+    record.insert("event_kind".to_string(), json!(input.message.event_kind));
+    record.insert("format".to_string(), json!(input.message.format.as_str()));
+    record.insert(
+        "content_bytes".to_string(),
+        json!(input.message.content.len()),
+    );
+    record.insert(
+        "payload_bytes".to_string(),
+        json!(telemetry::payload_bytes(&input.message.payload)),
+    );
+    if let Some(attempt) = input.attempt {
+        record.insert("attempt".to_string(), json!(attempt));
+    }
+    if let Some(error) = input.error {
+        record.insert("error".to_string(), json!(error));
+    }
+    if let Some(status) = input.status {
+        record.insert("status".to_string(), json!(status));
+    }
+    if let Some(extra) = &input.message.telemetry {
+        record.insert("route_result".to_string(), json!(extra.route_result));
+        record.insert("route_index".to_string(), json!(extra.route_index));
+        record.insert("batch_count".to_string(), json!(extra.batch_count));
+    }
+    record
 }
 
 fn jitter_for_attempt(attempt: u32) -> Duration {
@@ -457,7 +663,7 @@ mod tests {
 
     #[test]
     fn truncate_for_discord_clamps_oversized_content_under_limit() {
-        let s: String = std::iter::repeat('x').take(5000).collect();
+        let s = "x".repeat(5000);
         let out = truncate_for_discord(&s);
         assert!(out.chars().count() <= DISCORD_MAX_CONTENT_LEN);
         assert!(out.contains("[truncated, 5000 chars total]"));
@@ -465,7 +671,7 @@ mod tests {
 
     #[test]
     fn truncate_for_discord_handles_multibyte_chars_safely() {
-        let s: String = std::iter::repeat('가').take(3000).collect();
+        let s = "가".repeat(3000);
         let out = truncate_for_discord(&s);
         assert!(out.chars().count() <= DISCORD_MAX_CONTENT_LEN);
         assert!(out.is_char_boundary(out.len() - "[truncated, 3000 chars total]".len()));
@@ -503,6 +709,7 @@ mod tests {
             format: MessageFormat::Compact,
             content: "hello".into(),
             payload: json!({"session":"ops"}),
+            telemetry: None,
         };
         client
             .send(
@@ -530,6 +737,91 @@ mod tests {
         );
         stream.write_all(response.as_bytes()).await.unwrap();
         stream.shutdown().await.ok();
+    }
+
+    async fn serve_once_capture(
+        listener: tokio::net::TcpListener,
+        status_line: &'static str,
+        body: &'static str,
+    ) -> String {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0_u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        let response = format!(
+            "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.ok();
+        request
+    }
+
+    #[tokio::test]
+    async fn thread_target_posts_to_thread_message_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_once_capture(listener, "HTTP/1.1 204 No Content", ""));
+
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}")).unwrap();
+        let message = SinkMessage {
+            event_kind: "session.finished".into(),
+            format: MessageFormat::Compact,
+            content: "done".into(),
+            payload: json!({"session_id":"sess-1"}),
+            telemetry: None,
+        };
+
+        client
+            .send(&SinkTarget::DiscordThread("thread-123".into()), &message)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+
+        assert!(request.starts_with("POST /channels/thread-123/messages "));
+        assert!(request.contains("\"content\":\"done\""));
+        assert!(client.dlq_entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn thread_target_error_is_public_safe() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let private_body = r#"{"message":"Missing Access: private thread #secret-lane","threads":["secret-lane"]}"#;
+        let server = tokio::spawn(serve_once_capture(
+            listener,
+            "HTTP/1.1 403 Forbidden",
+            private_body,
+        ));
+
+        let client =
+            DiscordClient::for_tests_with_api_base("test-token", format!("http://{addr}")).unwrap();
+        let message = SinkMessage {
+            event_kind: "session.failed".into(),
+            format: MessageFormat::Alert,
+            content: "failed".into(),
+            payload: json!({"session_id":"sess-2"}),
+            telemetry: None,
+        };
+
+        let error = client
+            .send(&SinkTarget::DiscordThread("thread-404".into()), &message)
+            .await
+            .unwrap_err()
+            .to_string();
+        let _ = server.await.unwrap();
+
+        assert!(error.contains("thread is unreachable"));
+        assert!(!error.contains("secret-lane"));
+        assert!(!error.contains("threads"));
+        assert_eq!(client.dlq_entries().len(), 1);
+        assert!(
+            client.dlq_entries()[0]
+                .target
+                .starts_with("discord:thread:redacted:")
+        );
+        assert!(!client.dlq_entries()[0].target.contains("thread-404"));
     }
 
     #[tokio::test]
@@ -669,7 +961,8 @@ mod tests {
             event_kind: "github.ci-failed".into(),
             format: MessageFormat::Alert,
             content: "boom".into(),
-            payload: json!({"repo":"clawhip"}),
+            payload: json!({"repo":"clawhip", "correlation_id":"corr-214"}),
+            telemetry: None,
         };
         let error = client
             .send(
@@ -684,5 +977,40 @@ mod tests {
         assert_eq!(dlq.len(), 1);
         assert_eq!(dlq[0].payload["repo"], "clawhip");
         assert_eq!(dlq[0].retry_count, 3);
+        assert!(dlq[0].target.starts_with("discord:webhook:"));
+        assert!(!dlq[0].target.contains(&format!("http://{addr}/webhook")));
+        assert_eq!(dlq[0].correlation_id.as_deref(), Some("corr-214"));
+        assert_eq!(dlq[0].content_bytes, Some(4));
+        assert!(dlq[0].payload_bytes.is_some());
+    }
+
+    #[test]
+    fn record_dlq_redacts_target_and_preserves_correlation() {
+        let client = DiscordClient::from_config(Arc::new(AppConfig::default())).unwrap();
+        let message = SinkMessage {
+            event_kind: "github.ci-failed".into(),
+            format: MessageFormat::Alert,
+            content: "boom".into(),
+            payload: json!({"repo":"clawhip", "correlation_id":"corr-214"}),
+            telemetry: None,
+        };
+        let target = SinkTarget::DiscordWebhook(
+            "https://discord.com/api/webhooks/123456/secret-token".into(),
+        );
+
+        client.record_dlq(&target, &message, 3, "failed".into());
+
+        let dlq = client.dlq_entries();
+        assert_eq!(dlq.len(), 1);
+        assert!(
+            dlq[0]
+                .target
+                .starts_with("discord:webhook:discord.com/redacted/")
+        );
+        assert!(!dlq[0].target.contains("123456"));
+        assert!(!dlq[0].target.contains("secret-token"));
+        assert_eq!(dlq[0].correlation_id.as_deref(), Some("corr-214"));
+        assert_eq!(dlq[0].content_bytes, Some(4));
+        assert!(dlq[0].payload_bytes.is_some());
     }
 }

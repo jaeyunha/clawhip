@@ -111,12 +111,6 @@ pub struct AgentEvent {
     pub pr_url: Option<String>,
     pub command: Option<String>,
     pub tool_name: Option<String>,
-    pub tmux_session: Option<String>,
-    pub tmux_window: Option<String>,
-    pub tmux_pane: Option<String>,
-    pub tmux_pane_tty: Option<String>,
-    pub tmux_attached: Option<bool>,
-    pub tmux_client_count: Option<u64>,
     pub elapsed_secs: Option<u64>,
     pub summary: Option<String>,
     pub error_summary: Option<String>,
@@ -132,6 +126,14 @@ pub struct WorkspaceEvent {
     pub session_name: Option<String>,
     pub diff_fields: Vec<String>,
     pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscordNudgeIntentEvent {
+    pub intent_id: String,
+    pub reasons: Vec<String>,
+    pub content: String,
+    pub local_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

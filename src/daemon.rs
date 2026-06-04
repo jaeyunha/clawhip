@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -9,7 +10,8 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
 use serde_json::{Value, json};
-use tokio::sync::{RwLock, mpsc};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 use crate::Result;
 use crate::VERSION;
@@ -18,17 +20,42 @@ use crate::cron::CronSource;
 use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
 use crate::events::{IncomingEvent, MessageFormat, normalize_event};
-use crate::native_hooks::incoming_event_from_native_hook_json;
+use crate::native_hooks::{
+    NATIVE_NON_GIT_OUTCOME, NATIVE_NORMALIZATION_OUTCOME_FIELD,
+    incoming_event_from_native_hook_json,
+};
+use crate::native_observability::{
+    SharedNativeHookObservability, is_native_hook_event, native_event_telemetry_fields,
+    new_shared_native_hook_observability, snapshot_shared, with_native_observability,
+};
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
-use crate::sink::{DiscordSink, Sink, SlackSink};
+use crate::sink::{DiscordSink, LocalFileSink, Sink, SlackSink};
 use crate::source::{
     GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
     WorkspaceSource, list_active_tmux_registrations,
 };
+use crate::telemetry;
 use crate::update::{self, SharedPendingUpdate};
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
+const STALE_NATIVE_REPLAY_GRACE: Duration = Duration::from_secs(5 * 60);
+const STALE_NATIVE_REPLAY_REASON: &str = "stale_replay";
+const NATIVE_REPLAY_TIMESTAMP_POINTERS: &[&str] = &[
+    "/event_timestamp",
+    "/timestamp",
+    "/observed_at",
+    "/created_at",
+    "/event_payload/event_timestamp",
+    "/event_payload/timestamp",
+];
+const EVENT_REPLAY_TIMESTAMP_POINTERS: &[&str] = &[
+    "/first_seen_at",
+    "/event_timestamp",
+    "/timestamp",
+    "/observed_at",
+    "/created_at",
+];
 
 #[derive(Clone)]
 struct AppState {
@@ -37,6 +64,9 @@ struct AppState {
     tx: mpsc::Sender<IncomingEvent>,
     tmux_registry: SharedTmuxRegistry,
     pending_update: SharedPendingUpdate,
+    native_observability: SharedNativeHookObservability,
+    cron_state_path: PathBuf,
+    discord_watch_lock: Arc<Mutex<()>>,
 }
 
 pub async fn run(
@@ -47,6 +77,10 @@ pub async fn run(
     config.validate()?;
     let token_source = config.discord_token_source();
     println!("clawhip v{VERSION} starting (token_source: {token_source})");
+    telemetry::emit(daemon_record(
+        telemetry::reason::DAEMON_STARTUP,
+        json!({"version": VERSION, "token_source": token_source}),
+    ));
 
     let mut sinks: HashMap<String, Box<dyn Sink>> = HashMap::new();
     sinks.insert(
@@ -54,13 +88,16 @@ pub async fn run(
         Box::new(DiscordSink::from_config(config.clone())?),
     );
     sinks.insert("slack".into(), Box::new(SlackSink::default()));
+    sinks.insert("localfile".into(), Box::new(LocalFileSink));
     let renderer: Box<dyn Renderer> = Box::new(DefaultRenderer);
     let router = Router::new(config.clone());
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+    let native_observability = new_shared_native_hook_observability();
 
     let ci_batch_window = config.dispatch.ci_batch_window();
     let routine_batch_window = config.dispatch.routine_batch_window();
+    let dispatcher_native_observability = native_observability.clone();
     let dispatcher_handle = tokio::spawn(async move {
         let mut dispatcher = Dispatcher::new(
             rx,
@@ -69,6 +106,7 @@ pub async fn run(
             sinks,
             ci_batch_window,
             routine_batch_window,
+            dispatcher_native_observability,
         );
         dispatcher.run().await
     });
@@ -79,7 +117,10 @@ pub async fn run(
         tx.clone(),
     );
     spawn_source(WorkspaceSource::new(config.clone()), tx.clone());
-    spawn_source(CronSource::new(config.clone(), cron_state_path), tx.clone());
+    spawn_source(
+        CronSource::new(config.clone(), cron_state_path.clone()),
+        tx.clone(),
+    );
 
     let pending_update = update::new_shared_pending_update();
     {
@@ -113,13 +154,21 @@ pub async fn run(
         tx,
         tmux_registry,
         pending_update,
+        native_observability,
+        cron_state_path,
+        discord_watch_lock: Arc::new(Mutex::new(())),
     });
     let addr: SocketAddr = format!("{}:{}", config.daemon.bind_host, port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
     println!(
         "clawhip daemon v{VERSION} listening on http://{} (token_source: {token_source})",
-        listener.local_addr()?
+        local_addr
     );
+    telemetry::emit(daemon_record(
+        telemetry::reason::DAEMON_LISTENING,
+        json!({"version": VERSION, "addr": local_addr.to_string(), "token_source": token_source}),
+    ));
     tokio::select! {
         result = axum::serve(listener, app) => {
             result?;
@@ -140,7 +189,17 @@ where
     let source_name = source.name().to_string();
     tokio::spawn(async move {
         println!("clawhip source '{}' starting", source_name);
+        telemetry::emit(source_lifecycle_record(
+            telemetry::reason::SOURCE_START,
+            &source_name,
+            None,
+        ));
         if let Err(error) = source.run(tx.clone()).await {
+            telemetry::emit(source_lifecycle_record(
+                telemetry::reason::SOURCE_STOPPED,
+                &source_name,
+                Some(error.to_string()),
+            ));
             eprintln!("clawhip source '{}' stopped: {error}", source_name);
             if let Err(alert_error) = tx
                 .send(source_failure_alert_event(&source_name, &error.to_string()))
@@ -171,16 +230,67 @@ fn source_failure_alert_event(source_name: &str, error_message: &str) -> Incomin
     event
 }
 
+fn daemon_record(reason_code: &str, details: Value) -> serde_json::Map<String, Value> {
+    let mut record = telemetry::record(
+        telemetry::event_name::DAEMON_PHASE,
+        reason_code,
+        format!("daemon:{reason_code}"),
+    );
+    record.insert("details".to_string(), details);
+    record
+}
+
+fn source_lifecycle_record(
+    reason_code: &str,
+    source_name: &str,
+    error: Option<String>,
+) -> serde_json::Map<String, Value> {
+    let event_name = if reason_code == telemetry::reason::SOURCE_STOPPED {
+        telemetry::event_name::SOURCE_DEGRADED
+    } else {
+        telemetry::event_name::SOURCE_INVENTORY
+    };
+    let mut record = telemetry::record(event_name, reason_code, format!("source:{source_name}"));
+    record.insert("source".to_string(), json!(source_name));
+    if let Some(error) = error {
+        record.insert("error".to_string(), json!(error));
+    }
+    record
+}
+
+fn event_record(
+    event_name: &str,
+    reason_code: &str,
+    event: &IncomingEvent,
+    details: Value,
+) -> serde_json::Map<String, Value> {
+    let mut record = telemetry::record(
+        event_name,
+        reason_code,
+        telemetry::correlation_id_for_event(event),
+    );
+    record.insert("event_kind".to_string(), json!(event.canonical_kind()));
+    record.insert("details".to_string(), details);
+    record
+}
+
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let registered = state.tmux_registry.read().await.len();
+    let native_hooks = snapshot_shared(&state.native_observability);
     Json(health_payload(
         state.config.as_ref(),
         state.port,
         registered,
+        native_hooks,
     ))
 }
 
-fn health_payload(config: &AppConfig, port: u16, registered_tmux_sessions: usize) -> Value {
+fn health_payload(
+    config: &AppConfig,
+    port: u16,
+    registered_tmux_sessions: usize,
+    native_hooks: Value,
+) -> Value {
     json!({
         "ok": true,
         "version": VERSION,
@@ -193,6 +303,7 @@ fn health_payload(config: &AppConfig, port: u16, registered_tmux_sessions: usize
         "configured_workspace_monitors": config.monitors.workspace.len(),
         "configured_cron_jobs": config.cron.jobs.len(),
         "registered_tmux_sessions": registered_tmux_sessions,
+        "native_hooks": native_hooks,
     })
 }
 
@@ -204,6 +315,15 @@ async fn post_event(
     State(state): State<AppState>,
     Json(event): Json<IncomingEvent>,
 ) -> impl IntoResponse {
+    let canonical_kind = event.canonical_kind();
+    if let Some(defer) = stale_replay_defer(
+        canonical_kind,
+        &event.payload,
+        EVENT_REPLAY_TIMESTAMP_POINTERS,
+    ) {
+        return stale_replay_defer_response(canonical_kind, &defer);
+    }
+
     accept_event(&state, normalize_event(event)).await
 }
 
@@ -211,9 +331,68 @@ async fn post_native_hook(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
+    let raw_non_git = native_payload_is_non_git(&payload);
+    with_native_observability(&state.native_observability, |observability| {
+        observability.observe_received_raw(&payload);
+    });
+    eprintln!(
+        "clawhip native hook received: provider={} event={} repo={} session={}",
+        raw_native_field(
+            &payload,
+            &["/provider", "/source/provider", "/context/provider"],
+        ),
+        raw_native_field(
+            &payload,
+            &[
+                "/event_name",
+                "/event",
+                "/hook_event_name",
+                "/hookEventName",
+            ],
+        ),
+        raw_native_field(
+            &payload,
+            &[
+                "/repo_name",
+                "/context/repo_name",
+                "/project",
+                "/project_name",
+            ],
+        ),
+        raw_native_field(
+            &payload,
+            &[
+                "/session_id",
+                "/sessionId",
+                "/context/session_id",
+                "/event_payload/session_id",
+            ],
+        ),
+    );
+
     let event = match incoming_event_from_native_hook_json(&payload) {
         Ok(event) => normalize_event(event),
         Err(error) => {
+            with_native_observability(&state.native_observability, |observability| {
+                observability.observe_dropped_raw(&payload, "normalization_failed");
+            });
+            eprintln!(
+                "clawhip native hook dropped: provider={} event={} reason=normalization_failed error={}",
+                raw_native_field(
+                    &payload,
+                    &["/provider", "/source/provider", "/context/provider"],
+                ),
+                raw_native_field(
+                    &payload,
+                    &[
+                        "/event_name",
+                        "/event",
+                        "/hook_event_name",
+                        "/hookEventName",
+                    ],
+                ),
+                error
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"ok": false, "error": error.to_string()})),
@@ -222,13 +401,208 @@ async fn post_native_hook(
         }
     };
 
+    with_native_observability(&state.native_observability, |observability| {
+        observability.observe_normalized(&event);
+    });
+
+    if raw_non_git || native_hook_should_drop(&event) {
+        telemetry::emit(event_record(
+            telemetry::event_name::EVENT_DROPPED,
+            telemetry::reason::DROP_NON_GIT_NATIVE_HOOK,
+            &event,
+            json!({"dropped": true, "source": "native_hook"}),
+        ));
+        with_native_observability(&state.native_observability, |observability| {
+            observability.observe_dropped(&event, NATIVE_NON_GIT_OUTCOME);
+        });
+        eprintln!(
+            "clawhip native hook dropped: {} reason={}",
+            native_event_telemetry_fields(&event),
+            NATIVE_NON_GIT_OUTCOME
+        );
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "ok": true,
+                "type": event.kind,
+                "dropped": true,
+                "reason": "non_git",
+            })),
+        )
+            .into_response();
+    }
+
+    if let Some(defer) = stale_native_replay_defer(&event, &payload) {
+        with_native_observability(&state.native_observability, |observability| {
+            observability.observe_deferred(&event, defer.reason);
+        });
+        eprintln!(
+            "clawhip native hook deferred: {} reason={} age_secs={}",
+            native_event_telemetry_fields(&event),
+            defer.reason,
+            defer.age.as_secs()
+        );
+        return stale_replay_defer_response(&event.kind, &defer);
+    }
+
     accept_event(&state, event).await
+}
+
+fn native_payload_is_non_git(payload: &Value) -> bool {
+    payload
+        .get(NATIVE_NORMALIZATION_OUTCOME_FIELD)
+        .and_then(Value::as_str)
+        == Some(NATIVE_NON_GIT_OUTCOME)
+        || payload
+            .get("event_payload")
+            .and_then(|payload| payload.get(NATIVE_NORMALIZATION_OUTCOME_FIELD))
+            .and_then(Value::as_str)
+            == Some(NATIVE_NON_GIT_OUTCOME)
+        || payload
+            .get("payload")
+            .and_then(|payload| payload.get(NATIVE_NORMALIZATION_OUTCOME_FIELD))
+            .and_then(Value::as_str)
+            == Some(NATIVE_NON_GIT_OUTCOME)
+}
+
+fn raw_native_field(payload: &Value, pointers: &[&str]) -> String {
+    pointers
+        .iter()
+        .find_map(|pointer| payload.pointer(pointer).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn native_hook_should_drop(event: &IncomingEvent) -> bool {
+    if event
+        .payload
+        .get(NATIVE_NORMALIZATION_OUTCOME_FIELD)
+        .and_then(Value::as_str)
+        == Some(NATIVE_NON_GIT_OUTCOME)
+    {
+        return true;
+    }
+
+    event
+        .payload
+        .get("payload")
+        .and_then(|payload| payload.get(NATIVE_NORMALIZATION_OUTCOME_FIELD))
+        .and_then(Value::as_str)
+        == Some(NATIVE_NON_GIT_OUTCOME)
+}
+
+#[derive(Debug, Clone)]
+struct NativeReplayDefer {
+    reason: &'static str,
+    timestamp: String,
+    age: Duration,
+}
+
+fn stale_native_replay_defer(
+    event: &IncomingEvent,
+    raw_payload: &Value,
+) -> Option<NativeReplayDefer> {
+    stale_replay_defer(
+        event.canonical_kind(),
+        raw_payload,
+        NATIVE_REPLAY_TIMESTAMP_POINTERS,
+    )
+}
+
+fn stale_replay_defer(
+    kind: &str,
+    raw_payload: &Value,
+    timestamp_pointers: &[&str],
+) -> Option<NativeReplayDefer> {
+    if !is_replay_sensitive_native_kind(kind) {
+        return None;
+    }
+
+    let timestamp = replay_timestamp(raw_payload, timestamp_pointers)?;
+    let observed_at = parse_native_replay_timestamp(&timestamp)?;
+    let now = OffsetDateTime::now_utc();
+    let age = now - observed_at;
+    let age = age.try_into().ok()?;
+
+    (age > STALE_NATIVE_REPLAY_GRACE).then_some(NativeReplayDefer {
+        reason: STALE_NATIVE_REPLAY_REASON,
+        timestamp,
+        age,
+    })
+}
+
+fn is_replay_sensitive_native_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "tool.pre" | "tool.post" | "session.prompt-submitted" | "session.stopped"
+    )
+}
+
+fn replay_timestamp(raw_payload: &Value, pointers: &[&str]) -> Option<String> {
+    pointers
+        .iter()
+        .find_map(|pointer| timestamp_string(raw_payload.pointer(pointer)))
+}
+
+fn stale_replay_defer_response(kind: &str, defer: &NativeReplayDefer) -> axum::response::Response {
+    eprintln!(
+        "clawhip deferred stale replay: type={} reason={} timestamp={} age_secs={}",
+        kind,
+        defer.reason,
+        defer.timestamp,
+        defer.age.as_secs()
+    );
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "ok": true,
+            "type": kind,
+            "deferred": true,
+            "quarantined": true,
+            "reason": defer.reason,
+            "timestamp": defer.timestamp,
+            "age_secs": defer.age.as_secs(),
+        })),
+    )
+        .into_response()
+}
+
+fn timestamp_string(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(value) => {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_native_replay_timestamp(value: &str) -> Option<OffsetDateTime> {
+    if let Ok(parsed) = OffsetDateTime::parse(value, &Rfc3339) {
+        return Some(parsed);
+    }
+
+    let integer = value.trim().parse::<i64>().ok()?;
+    let unix_seconds = if integer.unsigned_abs() >= 10_000_000_000 {
+        integer / 1000
+    } else {
+        integer
+    };
+    OffsetDateTime::from_unix_timestamp(unix_seconds).ok()
 }
 
 async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response::Response {
     let envelope = match from_incoming_event(&event) {
         Ok(envelope) => envelope,
         Err(error) => {
+            if is_native_hook_event(&event) {
+                with_native_observability(&state.native_observability, |observability| {
+                    observability.observe_dropped(&event, "validation_error");
+                });
+            }
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"ok": false, "error": error.to_string()})),
@@ -237,22 +611,130 @@ async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response:
         }
     };
 
-    match enqueue_event(&state.tx, event.clone()).await {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "ok": true,
-                "type": event.kind,
-                "event_id": envelope.id.to_string(),
-            })),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"ok": false, "error": error.to_string()})),
-        )
-            .into_response(),
+    if event.canonical_kind() == "discord.message-create" {
+        if let Err(error) = handle_discord_watch(state, &event).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response();
+        }
+        return local_only_event_response(&event, &envelope);
     }
+
+    if event.canonical_kind() == "discord-watch.nudge-intent" {
+        return local_only_event_response(&event, &envelope);
+    }
+
+    match enqueue_event(&state.tx, event.clone()).await {
+        Ok(()) => {
+            expire_terminal_tmux_registration(state, &event).await;
+            telemetry::emit(event_record(
+                telemetry::event_name::EVENT_ACCEPTED,
+                telemetry::reason::ACCEPT_ENQUEUED,
+                &event,
+                json!({"event_id": envelope.id.to_string()}),
+            ));
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "ok": true,
+                    "type": event.kind,
+                    "event_id": envelope.id.to_string(),
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            if is_native_hook_event(&event) {
+                with_native_observability(&state.native_observability, |observability| {
+                    observability.observe_dropped(&event, "queue_unavailable");
+                });
+            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn local_only_event_response(
+    event: &IncomingEvent,
+    envelope: &crate::event::EventEnvelope,
+) -> axum::response::Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "ok": true,
+            "type": event.kind,
+            "event_id": envelope.id.to_string(),
+            "local_only": true,
+        })),
+    )
+        .into_response()
+}
+
+async fn handle_discord_watch(state: &AppState, event: &IncomingEvent) -> Result<()> {
+    let now_ms = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    let _guard = state.discord_watch_lock.lock().await;
+    crate::discord_watch::handle_local_intent_event(
+        &state.config.discord_watch,
+        &state.cron_state_path,
+        event,
+        now_ms as i64,
+    )?;
+    Ok(())
+}
+
+async fn expire_terminal_tmux_registration(state: &AppState, event: &IncomingEvent) {
+    if !is_terminal_session_event(event.canonical_kind()) {
+        return;
+    }
+
+    let candidates = terminal_session_candidates(&event.payload);
+    if candidates.is_empty() {
+        return;
+    }
+
+    let mut registry = state.tmux_registry.write().await;
+    for session in candidates {
+        if registry.remove(&session).is_some() {
+            telemetry::emit(tmux_terminal_expiry_record(&session));
+        }
+    }
+}
+
+fn is_terminal_session_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "session.finished" | "session.stopped" | "session.pr-created"
+    )
+}
+
+fn tmux_terminal_expiry_record(session: &str) -> serde_json::Map<String, Value> {
+    let mut record = telemetry::record(
+        telemetry::event_name::SOURCE_INVENTORY,
+        "terminal_session_expired",
+        format!("source:tmux:{session}"),
+    );
+    record.insert("source".to_string(), json!("tmux"));
+    record.insert("session".to_string(), json!(session));
+    record
+}
+
+fn terminal_session_candidates(payload: &Value) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for key in ["session", "session_name", "session_id", "agent_name"] {
+        if let Some(value) = payload.get(key).and_then(Value::as_str) {
+            let value = value.trim();
+            if !value.is_empty() && !candidates.iter().any(|candidate| candidate == value) {
+                candidates.push(value.to_string());
+            }
+        }
+    }
+    candidates
 }
 
 async fn register_tmux(
@@ -515,6 +997,205 @@ mod tests {
     use tempfile::tempdir;
     use tokio::time::{Duration, timeout};
 
+    fn native_hook_test_state() -> (AppState, mpsc::Receiver<IncomingEvent>) {
+        let (tx, rx) = mpsc::channel(8);
+        (
+            AppState {
+                config: Arc::new(AppConfig::default()),
+                port: 25294,
+                tx,
+                tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+                pending_update: update::new_shared_pending_update(),
+                native_observability: new_shared_native_hook_observability(),
+                cron_state_path: PathBuf::from("cron-state.json"),
+                discord_watch_lock: Arc::new(Mutex::new(())),
+            },
+            rx,
+        )
+    }
+
+    fn tmux_registration(session: &str) -> RegisteredTmuxSession {
+        RegisteredTmuxSession {
+            session: session.into(),
+            channel: Some("alerts".into()),
+            mention: Some("<@123>".into()),
+            routing: RoutingMetadata::default(),
+            keywords: vec!["error".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 15,
+            format: None,
+            registered_at: "2026-04-02T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliWatch,
+            parent_process: Some(ParentProcessInfo {
+                pid: 4242,
+                name: Some("codex".into()),
+            }),
+            active_wrapper_monitor: true,
+        }
+    }
+
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git init");
+        assert!(
+            git.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&git.stderr)
+        );
+        dir
+    }
+
+    fn stale_rfc3339() -> String {
+        (OffsetDateTime::now_utc() - time::Duration::hours(1))
+            .format(&Rfc3339)
+            .expect("format stale timestamp")
+    }
+
+    fn fresh_rfc3339() -> String {
+        OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .expect("format fresh timestamp")
+    }
+
+    fn native_payload(repo: &std::path::Path, event_name: &str) -> Value {
+        json!({
+            "provider": "codex",
+            "event_name": event_name,
+            "directory": repo,
+            "cwd": repo,
+            "event_payload": {
+                "session_id": "sess-213",
+                "tool_name": "Bash",
+                "cwd": repo
+            }
+        })
+    }
+
+    async fn post_native_payload(payload: Value) -> (Value, mpsc::Receiver<IncomingEvent>) {
+        let (state, rx) = native_hook_test_state();
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+        (response_json, rx)
+    }
+
+    fn insert_timestamp_at_path(payload: &mut Value, path: &[&str], value: String) {
+        let mut current = payload;
+        for key in &path[..path.len() - 1] {
+            current = current
+                .as_object_mut()
+                .expect("object")
+                .entry((*key).to_string())
+                .or_insert_with(|| json!({}));
+        }
+        current
+            .as_object_mut()
+            .expect("object")
+            .insert(path[path.len() - 1].to_string(), Value::String(value));
+    }
+
+    #[tokio::test]
+    async fn accepted_terminal_session_event_expires_matching_tmux_registration() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        registry
+            .write()
+            .await
+            .insert("issue-221".into(), tmux_registration("issue-221"));
+        registry
+            .write()
+            .await
+            .insert("still-active".into(), tmux_registration("still-active"));
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: registry.clone(),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+
+        let response = accept_event(
+            &state,
+            IncomingEvent {
+                kind: "session.finished".into(),
+                channel: None,
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({
+                    "agent_name": "issue-221",
+                    "session": "issue-221",
+                    "session_id": "issue-221",
+                    "status": "finished"
+                }),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            rx.recv().await.expect("queued event").kind,
+            "session.finished"
+        );
+        let registry = registry.read().await;
+        assert!(!registry.contains_key("issue-221"));
+        assert!(registry.contains_key("still-active"));
+    }
+
+    #[tokio::test]
+    async fn accepted_non_terminal_session_event_preserves_tmux_registration() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        registry
+            .write()
+            .await
+            .insert("issue-221".into(), tmux_registration("issue-221"));
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: registry.clone(),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+
+        let response = accept_event(
+            &state,
+            IncomingEvent {
+                kind: "session.blocked".into(),
+                channel: None,
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({
+                    "agent_name": "issue-221",
+                    "session": "issue-221",
+                    "status": "blocked"
+                }),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            rx.recv().await.expect("queued event").kind,
+            "session.blocked"
+        );
+        assert!(registry.read().await.contains_key("issue-221"));
+    }
+
     #[test]
     fn health_payload_includes_version_and_token_source() {
         let mut config = AppConfig::default();
@@ -523,7 +1204,12 @@ mod tests {
         config.monitors.tmux.sessions.push(Default::default());
         config.monitors.workspace.push(Default::default());
 
-        let payload = health_payload(&config, 25294, 3);
+        let payload = health_payload(
+            &config,
+            25294,
+            3,
+            snapshot_shared(&new_shared_native_hook_observability()),
+        );
 
         assert_eq!(payload["ok"], Value::Bool(true));
         assert_eq!(payload["version"], Value::String(VERSION.to_string()));
@@ -533,6 +1219,7 @@ mod tests {
         assert_eq!(payload["configured_tmux_monitors"], Value::from(1));
         assert_eq!(payload["configured_workspace_monitors"], Value::from(1));
         assert_eq!(payload["registered_tmux_sessions"], Value::from(3));
+        assert!(payload["native_hooks"]["totals"]["received"].is_number());
     }
 
     #[tokio::test]
@@ -610,6 +1297,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_event_defers_stale_tool_replay_before_normalization_and_enqueue() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+        let event = IncomingEvent {
+            kind: "tool.post".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "first_seen_at": stale_rfc3339(),
+                "tool": "codex",
+                "summary": "old replay"
+            }),
+        };
+
+        let response = post_event(State(state), Json(event)).await.into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response_json["ok"], json!(true));
+        assert_eq!(response_json["type"], json!("tool.post"));
+        assert_eq!(response_json["deferred"], json!(true));
+        assert_eq!(response_json["quarantined"], json!(true));
+        assert_eq!(response_json["reason"], json!(STALE_NATIVE_REPLAY_REASON));
+        assert!(rx.try_recv().is_err(), "stale replay should not enqueue");
+    }
+
+    #[tokio::test]
+    async fn post_event_preserves_fresh_tool_payload_with_first_seen_at() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+        let event = IncomingEvent {
+            kind: "tool.post".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "first_seen_at": fresh_rfc3339(),
+                "tool": "codex",
+                "summary": "fresh"
+            }),
+        };
+
+        let response = post_event(State(state), Json(event)).await.into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let queued = rx.recv().await.expect("queued event");
+        assert_eq!(queued.kind, "tool.post");
+    }
+
+    #[tokio::test]
     async fn post_event_returns_event_id_and_preserves_normalized_metadata() {
         let (tx, mut rx) = mpsc::channel(1);
         let state = AppState {
@@ -618,6 +1376,9 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
         let event = IncomingEvent::agent_started(
             "worker-1".into(),
@@ -651,6 +1412,358 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discord_watch_nudge_intent_ingress_is_local_only_without_enqueueing() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+
+        let response = accept_event(
+            &state,
+            IncomingEvent {
+                kind: "discord-watch.nudge-intent".into(),
+                channel: Some("must-not-route".into()),
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({
+                    "id": "intent-1",
+                    "created_at_ms": 1000,
+                    "reasons": ["t3-channel-backlog"],
+                    "source_channel_id": "fixture-general",
+                    "source_channel_name": "general",
+                    "nudge_target_channel_id": "fixture-nudge-target",
+                    "content": "UltraWorkers: <#fixture-general> / general 스윕하라.",
+                    "local_only": true
+                }),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(
+            timeout(Duration::from_millis(25), rx.recv()).await.is_err(),
+            "local nudge intents must not enter generic Discord dispatch routing"
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_watch_message_create_writes_local_intent_without_enqueueing() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let dir = tempdir().expect("tempdir");
+        let intents = dir.path().join("discord-watch-intents.jsonl");
+        let mut config = AppConfig::default();
+        config.discord_watch.enabled = true;
+        config.discord_watch.gaebal_gajae_user_id = "fixture-gaebal".into();
+        config.discord_watch.watched_channels = vec![crate::config::DiscordWatchChannel {
+            id: "fixture-general".into(),
+            name: "general".into(),
+        }];
+        config.discord_watch.owner_user_ids = vec!["owner".into()];
+        config.discord_watch.state_file = Some(dir.path().join("discord-watch-state.json"));
+        config.discord_watch.intent_file = Some(intents.clone());
+        let state = AppState {
+            config: Arc::new(config),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: dir.path().join("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+
+        let response = accept_event(
+            &state,
+            IncomingEvent {
+                kind: "discord.message-create".into(),
+                channel: Some("dm".into()),
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({
+                    "message_id": "dm1",
+                    "channel_id": "dm",
+                    "channel_name": "owner-dm",
+                    "author_id": "owner",
+                    "content": "please sweep",
+                    "mentions": [],
+                    "direct_message": true,
+                    "author_is_owner": false,
+                    "timestamp_ms": 1000
+                }),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(
+            timeout(Duration::from_millis(25), rx.recv()).await.is_err(),
+            "discord watch ingress must not enqueue for live dispatch"
+        );
+        let jsonl = fs::read_to_string(intents).expect("intent jsonl");
+        assert!(
+            jsonl.contains("\"local_only\":true"),
+            "intent must be persisted as local-only JSONL"
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_watch_local_intent_write_failure_rejects_without_enqueueing() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let dir = tempdir().expect("tempdir");
+        let mut config = AppConfig::default();
+        config.discord_watch.enabled = true;
+        config.discord_watch.gaebal_gajae_user_id = "fixture-gaebal".into();
+        config.discord_watch.watched_channels = vec![crate::config::DiscordWatchChannel {
+            id: "fixture-general".into(),
+            name: "general".into(),
+        }];
+        config.discord_watch.owner_user_ids = vec!["owner".into()];
+        config.discord_watch.state_file = Some(dir.path().join("discord-watch-state.json"));
+        config.discord_watch.intent_file = Some(dir.path().to_path_buf());
+        let state = AppState {
+            config: Arc::new(config),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: dir.path().join("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+
+        let response = accept_event(
+            &state,
+            IncomingEvent {
+                kind: "discord.message-create".into(),
+                channel: Some("dm".into()),
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({
+                    "message_id": "dm1",
+                    "channel_id": "dm",
+                    "channel_name": "owner-dm",
+                    "author_id": "owner",
+                    "content": "please sweep",
+                    "mentions": [],
+                    "direct_message": true,
+                    "author_is_owner": false,
+                    "timestamp_ms": 1000
+                }),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            timeout(Duration::from_millis(25), rx.recv()).await.is_err(),
+            "failed local intent writes must not fall through to dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_watch_serializes_concurrent_threshold_updates() {
+        let (tx, mut rx) = mpsc::channel(5);
+        let dir = tempdir().expect("tempdir");
+        let intents = dir.path().join("discord-watch-intents.jsonl");
+        let mut config = AppConfig::default();
+        config.discord_watch.enabled = true;
+        config.discord_watch.gaebal_gajae_user_id = "fixture-gaebal".into();
+        config.discord_watch.watched_channels = vec![crate::config::DiscordWatchChannel {
+            id: "fixture-general".into(),
+            name: "general".into(),
+        }];
+        config.discord_watch.global_cooldown_ms = 0;
+        config.discord_watch.channel_cooldown_ms = 0;
+        config.discord_watch.state_file = Some(dir.path().join("discord-watch-state.json"));
+        config.discord_watch.intent_file = Some(intents.clone());
+        let gaebal = config.discord_watch.gaebal_gajae_user_id.clone();
+        let state = AppState {
+            config: Arc::new(config),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: dir.path().join("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+
+        let event = |id: &str| IncomingEvent {
+            kind: "discord.message-create".into(),
+            channel: Some("fixture-general".into()),
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "message_id": id,
+                "channel_id": "fixture-general",
+                "channel_name": "general",
+                "author_id": "user",
+                "content": format!("<@{gaebal}>"),
+                "mentions": [gaebal.as_str()],
+                "direct_message": false,
+                "author_is_owner": false,
+                "timestamp_ms": 1000
+            }),
+        };
+
+        let (r1, r2, r3, r4, r5) = tokio::join!(
+            accept_event(&state, event("m1")),
+            accept_event(&state, event("m2")),
+            accept_event(&state, event("m3")),
+            accept_event(&state, event("m4")),
+            accept_event(&state, event("m5")),
+        );
+        for response in [r1, r2, r3, r4, r5] {
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        assert!(
+            timeout(Duration::from_millis(25), rx.recv()).await.is_err(),
+            "discord watch ingress must remain local-only under concurrency"
+        );
+        let jsonl = fs::read_to_string(intents).expect("intent jsonl");
+        assert_eq!(jsonl.lines().count(), 1);
+        assert!(jsonl.contains("t1-pending-mentions"));
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_observability_counts_accepted_event() {
+        let repo = git_repo();
+        let payload = native_payload(repo.path(), "SessionStart");
+        let (tx, mut rx) = mpsc::channel(1);
+        let observability = new_shared_native_hook_observability();
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: observability.clone(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let queued = rx.recv().await.expect("queued event");
+        assert_eq!(queued.kind, "session.started");
+
+        let snapshot = snapshot_shared(&observability);
+        assert_eq!(snapshot["totals"]["received"], json!(1));
+        assert_eq!(snapshot["totals"]["normalized"], json!(1));
+        assert_eq!(snapshot["recent_groups"][0]["provider"], json!("codex"));
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_observability_counts_rejected_event() {
+        let (tx, _rx) = mpsc::channel(1);
+        let observability = new_shared_native_hook_observability();
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: observability.clone(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+        let payload = json!({"provider": "codex", "event_name": "Bogus"});
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let snapshot = snapshot_shared(&observability);
+        assert_eq!(snapshot["totals"]["received"], json!(1));
+        assert_eq!(snapshot["totals"]["dropped"], json!(1));
+        assert_eq!(snapshot["reasons"]["normalization_failed"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_observability_counts_non_git_drop() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let observability = new_shared_native_hook_observability();
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: observability.clone(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+        let dir = tempdir().expect("tempdir");
+        let payload = json!({
+            "provider": "codex",
+            "event_name": "SessionStart",
+            "directory": dir.path(),
+            "event_payload": {}
+        });
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(rx.try_recv().is_err());
+
+        let snapshot = snapshot_shared(&observability);
+        assert_eq!(snapshot["totals"]["received"], json!(1));
+        assert_eq!(snapshot["totals"]["normalized"], json!(1));
+        assert_eq!(snapshot["totals"]["dropped"], json!(1));
+        assert_eq!(snapshot["reasons"]["non_git"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_observability_counts_stale_defer() {
+        let repo = git_repo();
+        let mut payload = native_payload(repo.path(), "PostToolUse");
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("timestamp".into(), Value::String(stale_rfc3339()));
+        let (tx, mut rx) = mpsc::channel(1);
+        let observability = new_shared_native_hook_observability();
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: observability.clone(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(rx.try_recv().is_err());
+
+        let snapshot = snapshot_shared(&observability);
+        assert_eq!(snapshot["totals"]["received"], json!(1));
+        assert_eq!(snapshot["totals"]["normalized"], json!(1));
+        assert_eq!(snapshot["totals"]["deferred"], json!(1));
+        assert_eq!(snapshot["reasons"]["stale_replay"], json!(1));
+    }
+
+    #[tokio::test]
     async fn post_native_hook_accepts_codex_payload_and_queues_normalized_event() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("clawhip");
@@ -672,6 +1785,9 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
         let payload = json!({
             "provider": "codex",
@@ -703,6 +1819,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_native_hook_queues_ask_tool_as_session_blocked() {
+        let repo = git_repo();
+        let mut payload = native_payload(repo.path(), "PreToolUse");
+        payload["provider"] = json!("claude-code");
+        payload["event_payload"]["tool_name"] = json!("askuserquestion");
+        payload["event_payload"]["tool_input"] = json!({
+            "question": "Need operator approval?\nDo not dump the full transcript."
+        });
+
+        let (response_json, mut rx) = post_native_payload(payload).await;
+        assert_eq!(response_json["ok"], json!(true));
+        assert_eq!(response_json["type"], json!("session.blocked"));
+
+        let queued = rx.recv().await.expect("queued event");
+        assert_eq!(queued.kind, "session.blocked");
+        assert_eq!(queued.payload["tool"], json!("claude-code"));
+        assert_eq!(queued.payload["agent_name"], json!("claude-code"));
+        assert_eq!(queued.payload["route_key"], json!("question.requested"));
+        assert_eq!(
+            queued.payload["summary"],
+            json!("Need operator approval? Do not dump the full transcript.")
+        );
+        assert_eq!(queued.payload["event_payload"]["redacted"], json!(true));
+        assert!(queued.payload["event_payload"].get("tool_input").is_none());
+    }
+
+    #[tokio::test]
     async fn post_native_hook_rejects_unsupported_event() {
         let (tx, _rx) = mpsc::channel(1);
         let state = AppState {
@@ -711,6 +1854,9 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
         let payload = json!({
             "provider": "claude-code",
@@ -731,6 +1877,173 @@ mod tests {
                 .as_str()
                 .is_some_and(|error| error.contains("unsupported native hook event"))
         );
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_defers_stale_payloads_from_all_trusted_timestamp_paths() {
+        let repo = git_repo();
+        let cases = [
+            vec!["event_timestamp"],
+            vec!["timestamp"],
+            vec!["observed_at"],
+            vec!["created_at"],
+            vec!["event_payload", "event_timestamp"],
+            vec!["event_payload", "timestamp"],
+        ];
+
+        for path in cases {
+            let mut payload = native_payload(repo.path(), "PostToolUse");
+            insert_timestamp_at_path(&mut payload, &path, stale_rfc3339());
+
+            let (response_json, mut rx) = post_native_payload(payload).await;
+            assert_eq!(response_json["ok"], json!(true));
+            assert_eq!(response_json["type"], json!("tool.post"));
+            assert_eq!(response_json["deferred"], json!(true));
+            assert_eq!(response_json["quarantined"], json!(true));
+            assert_eq!(response_json["reason"], json!(STALE_NATIVE_REPLAY_REASON));
+            assert!(
+                rx.try_recv().is_err(),
+                "stale payload at {path:?} should not enqueue"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_defers_all_replay_sensitive_native_kinds() {
+        let repo = git_repo();
+        let cases = [
+            ("PreToolUse", "tool.pre"),
+            ("PostToolUse", "tool.post"),
+            ("UserPromptSubmit", "session.prompt-submitted"),
+            ("Stop", "session.stopped"),
+        ];
+
+        for (event_name, expected_kind) in cases {
+            let mut payload = native_payload(repo.path(), event_name);
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("timestamp".into(), Value::String(stale_rfc3339()));
+
+            let (response_json, mut rx) = post_native_payload(payload).await;
+            assert_eq!(response_json["type"], json!(expected_kind));
+            assert_eq!(response_json["deferred"], json!(true));
+            assert!(
+                rx.try_recv().is_err(),
+                "{expected_kind} stale replay should not enqueue"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_stale_session_started_still_enqueues() {
+        let repo = git_repo();
+        let mut payload = native_payload(repo.path(), "SessionStart");
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("timestamp".into(), Value::String(stale_rfc3339()));
+
+        let (response_json, mut rx) = post_native_payload(payload).await;
+        assert_eq!(response_json["type"], json!("session.started"));
+        assert!(response_json.get("deferred").is_none());
+        let queued = rx.recv().await.expect("queued event");
+        assert_eq!(queued.kind, "session.started");
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_preserves_fresh_timestamped_tool_post() {
+        let repo = git_repo();
+        let mut payload = native_payload(repo.path(), "PostToolUse");
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("timestamp".into(), Value::String(fresh_rfc3339()));
+
+        let (response_json, mut rx) = post_native_payload(payload).await;
+        assert_eq!(response_json["type"], json!("tool.post"));
+        assert!(response_json["event_id"].as_str().is_some());
+        let queued = rx.recv().await.expect("queued event");
+        assert_eq!(queued.kind, "tool.post");
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_preserves_timestampless_tool_post() {
+        let repo = git_repo();
+        let payload = native_payload(repo.path(), "PostToolUse");
+
+        let (response_json, mut rx) = post_native_payload(payload).await;
+        assert_eq!(response_json["type"], json!("tool.post"));
+        assert!(response_json["event_id"].as_str().is_some());
+        let queued = rx.recv().await.expect("queued event");
+        assert_eq!(queued.kind, "tool.post");
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_invalid_timestamp_enqueues() {
+        let repo = git_repo();
+        let mut payload = native_payload(repo.path(), "PostToolUse");
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("timestamp".into(), Value::String("not-a-time".into()));
+
+        let (response_json, mut rx) = post_native_payload(payload).await;
+        assert_eq!(response_json["type"], json!("tool.post"));
+        assert!(response_json.get("deferred").is_none());
+        let queued = rx.recv().await.expect("queued event");
+        assert_eq!(queued.kind, "tool.post");
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_does_not_treat_stop_context_last_prompt_at_as_event_timestamp() {
+        let repo = git_repo();
+        let mut payload = native_payload(repo.path(), "Stop");
+        payload.as_object_mut().unwrap().insert(
+            "stop_context".into(),
+            json!({ "last_prompt_at": stale_rfc3339() }),
+        );
+
+        let (response_json, mut rx) = post_native_payload(payload).await;
+        assert_eq!(response_json["type"], json!("session.stopped"));
+        assert!(response_json.get("deferred").is_none());
+        let queued = rx.recv().await.expect("queued event");
+        assert_eq!(queued.kind, "session.stopped");
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_accepts_but_drops_non_git_payloads_before_enqueue() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+        let dir = tempdir().expect("tempdir");
+        let payload = json!({
+            "provider": "codex",
+            "event_name": "SessionStart",
+            "directory": dir.path(),
+            "event_payload": {},
+            "normalization_outcome": NATIVE_NON_GIT_OUTCOME
+        });
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response_json["ok"], json!(true));
+        assert_eq!(response_json["dropped"], json!(true));
+        assert_eq!(response_json["reason"], json!(NATIVE_NON_GIT_OUTCOME));
+        assert!(rx.try_recv().is_err(), "non-git payload should not enqueue");
     }
 
     #[tokio::test]
@@ -763,6 +2076,9 @@ mod tests {
             tx,
             tmux_registry: registry,
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = list_tmux(State(state)).await.into_response();
@@ -797,6 +2113,9 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -825,6 +2144,9 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: pending,
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = update_status(State(state)).await.into_response();
@@ -846,6 +2168,9 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = approve_update(State(state)).await.into_response();
@@ -879,6 +2204,9 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: pending.clone(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = dismiss_update(State(state)).await.into_response();
@@ -900,6 +2228,9 @@ mod tests {
             tx,
             tmux_registry: Arc::new(RwLock::new(HashMap::new())),
             pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
         };
 
         let response = dismiss_update(State(state)).await.into_response();

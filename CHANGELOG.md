@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.9 - 2026-06-04
+
+### Highlights
+
+- add local file sinks and skip idle tmux polling so operators can archive routing output without noisy dead-pane sweeps
+- move CI/release execution onto the self-hosted GAJAE runner path and keep runner prerequisite failures actionable
+- prevent terminal tmux watches from dispatching stale alerts after sessions complete or panes disappear
+- add a recipe-first documentation front door for faster operator setup
+- surface operator questions from native ask tools without losing route context
+- support explicit Discord thread routing targets with redacted diagnostics and telemetry
+- add gateway allowlist verification so route/channel drift is caught before dispatch
+- expose the GAJAE CLI bridge for local profile/status dogfooding
+- add a disabled-by-default Discord watch sidecar that persists local nudge intents without live dispatch
+
+### Upgrade notes
+
+- crate version is now `0.6.9`
+- existing route/config schema remains compatible; no migration required
+- release and CI workflows expect a self-hosted runner labelled `gajae-layofflabs-2`
+
+## 0.6.8 - 2026-05-08
+
+### Highlights
+
+- harden tmux keyword monitoring so stale scrollback and wrapper/audit noise no longer re-trigger false alerts
+- add native hook ingress observability and routing telemetry so dropped, deferred, default-routed, and explicitly-routed hook events are diagnosable without log archaeology
+- make replay/restart handling safer by deferring stale native hook replays before they spray into live channels
+- allow configuring clawhip daemon Tokio worker threads at startup for constrained hosts
+
+### Upgrade notes
+
+- crate version is now `0.6.8`
+- existing route/config schema remains compatible; no migration required
+
 ## 0.6.7 - 2026-04-12
 
 ### Highlights
@@ -69,29 +103,6 @@
 
 - if you were using wrapper-specific launch flows, migrate to provider-owned hook registration plus `clawhip native hook` for local testing
 - the shared v1 contract now documents only `SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`
-
-## 0.6.0 - 2026-04-09
-
-### Highlights
-
-- replace the old bespoke OMC/OMX wrapper glue with provider-native Codex + Claude hook registration built around `clawhip native hook`
-- preserve prompt-submit and stop lifecycle events in the provider-native flow so real interactive sessions emit the same critical lifecycle signals clawhip expects
-- fix Codex native-hook installation/detection to use `~/.codex/hooks.json` as the real hook registry surface instead of treating `.codex/config.toml` as installed-state evidence
-- add tmux session/pane metadata to native hook payloads, including pane id, pane tty, attached state, and client count
-- preserve the tmux metadata through normalization and rendering so local hook logs stay attributable to the originating tmux pane/session
-
-### Documentation and tooling
-
-- update public docs to describe the shared provider-native hook contract instead of the older wrapper/launcher-specific hook assets
-- remove the checked-in OMC/OMX wrapper helper scripts and legacy hook assets that were superseded by provider-owned hook registration
-- add provider-native docs regression coverage so the new installation guidance remains consistent
-
-### Upgrade notes
-
-- crate version is now `0.6.0`
-- rerun `clawhip hooks install --all --scope global --force` to install the latest global Codex/Claude hook wiring into `~/.codex/hooks.json` and `~/.claude/settings.json`
-- Codex hook installation now targets `~/.codex/hooks.json`; `.codex/config.toml` remains a general config surface and should not be treated as the hook registry
-- if you were relying on the older wrapper-specific OMC/OMX launch helpers or checked-in wrapper hook assets, migrate to provider-owned hook registration plus `clawhip native hook` for local verification
 
 ## 0.5.4 - 2026-04-05
 
