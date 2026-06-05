@@ -29,6 +29,8 @@ pub struct AppConfig {
     pub monitors: MonitorConfig,
     #[serde(default, skip_serializing_if = "CronConfig::is_empty")]
     pub cron: CronConfig,
+    #[serde(default, skip_serializing_if = "DiscordWatchConfig::is_empty")]
+    pub discord_watch: DiscordWatchConfig,
     #[serde(default, skip_serializing_if = "crate::update::UpdateConfig::is_empty")]
     pub update: crate::update::UpdateConfig,
 }
@@ -140,6 +142,11 @@ pub struct RouteRule {
     #[serde(default = "default_sink_name")]
     pub sink: String,
     pub channel: Option<String>,
+    /// Explicit Discord thread ID target. Discord threads are channel-like
+    /// endpoints, but keeping this separate from `channel` preserves operator
+    /// intent and avoids hidden ID heuristics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
     /// Human-readable Discord channel name hint for binding verification.
     /// When set, `clawhip config verify-bindings` compares the live channel
     /// name against this value to detect drift.
@@ -147,6 +154,8 @@ pub struct RouteRule {
     pub channel_name: Option<String>,
     pub webhook: Option<String>,
     pub slack_webhook: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<String>,
     pub mention: Option<String>,
     #[serde(default)]
     pub allow_dynamic_tokens: bool,
@@ -161,9 +170,11 @@ impl Default for RouteRule {
             filter: BTreeMap::new(),
             sink: default_sink_name(),
             channel: None,
+            thread: None,
             channel_name: None,
             webhook: None,
             slack_webhook: None,
+            local_path: None,
             mention: None,
             allow_dynamic_tokens: false,
             format: None,
@@ -196,10 +207,22 @@ impl RouteRule {
             .flatten()
     }
 
+    pub fn discord_thread_target(&self) -> Option<&str> {
+        (self.effective_sink() == "discord")
+            .then(|| non_empty_trimmed(self.thread.as_deref()))
+            .flatten()
+    }
+
     pub fn slack_webhook_target(&self) -> Option<&str> {
         non_empty_trimmed(self.slack_webhook.as_deref()).or_else(|| {
             (self.sink.trim() == "slack").then(|| non_empty_trimmed(self.webhook.as_deref()))?
         })
+    }
+
+    pub fn local_file_target(&self) -> Option<&str> {
+        (self.effective_sink() == "localfile")
+            .then(|| non_empty_trimmed(self.local_path.as_deref()))
+            .flatten()
     }
 
     fn has_any_webhook_target(&self) -> bool {
@@ -355,6 +378,88 @@ impl Default for WorkspaceMonitor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordWatchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_discord_watch_channels")]
+    pub watched_channels: Vec<DiscordWatchChannel>,
+    #[serde(default)]
+    pub banned_channel_ids: Vec<String>,
+    #[serde(default = "default_discord_watch_banned_channel_names")]
+    pub banned_channel_names: Vec<String>,
+    #[serde(default = "default_gaebal_gajae_user_id")]
+    pub gaebal_gajae_user_id: String,
+    #[serde(default)]
+    pub owner_user_ids: Vec<String>,
+    #[serde(default = "default_nudge_target_channel_id")]
+    pub nudge_target_channel_id: Option<String>,
+    #[serde(default = "default_pending_mentions_threshold")]
+    pub pending_mentions_threshold: u64,
+    #[serde(default = "default_direct_mention_persist_ms")]
+    pub direct_mention_persist_ms: i64,
+    #[serde(default = "default_channel_message_threshold")]
+    pub channel_message_threshold: u64,
+    #[serde(default = "default_discord_watch_global_cooldown_ms")]
+    pub global_cooldown_ms: i64,
+    #[serde(default = "default_discord_watch_channel_cooldown_ms")]
+    pub channel_cooldown_ms: i64,
+    #[serde(default = "default_discord_watch_doctrine_template")]
+    pub doctrine_template: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscordWatchChannel {
+    pub id: String,
+    pub name: String,
+}
+
+impl Default for DiscordWatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            watched_channels: default_discord_watch_channels(),
+            banned_channel_ids: Vec::new(),
+            banned_channel_names: default_discord_watch_banned_channel_names(),
+            gaebal_gajae_user_id: default_gaebal_gajae_user_id(),
+            owner_user_ids: Vec::new(),
+            nudge_target_channel_id: default_nudge_target_channel_id(),
+            pending_mentions_threshold: default_pending_mentions_threshold(),
+            direct_mention_persist_ms: default_direct_mention_persist_ms(),
+            channel_message_threshold: default_channel_message_threshold(),
+            global_cooldown_ms: default_discord_watch_global_cooldown_ms(),
+            channel_cooldown_ms: default_discord_watch_channel_cooldown_ms(),
+            doctrine_template: default_discord_watch_doctrine_template(),
+            state_file: None,
+            intent_file: None,
+        }
+    }
+}
+
+impl DiscordWatchConfig {
+    fn is_empty(&self) -> bool {
+        !self.enabled
+            && self.watched_channels == default_discord_watch_channels()
+            && self.banned_channel_ids.is_empty()
+            && self.banned_channel_names == default_discord_watch_banned_channel_names()
+            && self.gaebal_gajae_user_id == default_gaebal_gajae_user_id()
+            && self.owner_user_ids.is_empty()
+            && self.nudge_target_channel_id == default_nudge_target_channel_id()
+            && self.pending_mentions_threshold == default_pending_mentions_threshold()
+            && self.direct_mention_persist_ms == default_direct_mention_persist_ms()
+            && self.channel_message_threshold == default_channel_message_threshold()
+            && self.global_cooldown_ms == default_discord_watch_global_cooldown_ms()
+            && self.channel_cooldown_ms == default_discord_watch_channel_cooldown_ms()
+            && self.doctrine_template == default_discord_watch_doctrine_template()
+            && self.state_file.is_none()
+            && self.intent_file.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronConfig {
     #[serde(default = "default_cron_poll_interval_secs")]
     pub poll_interval_secs: u64,
@@ -452,6 +557,37 @@ fn default_cron_poll_interval_secs() -> u64 {
 }
 fn default_cron_timezone() -> String {
     "UTC".to_string()
+}
+
+fn default_discord_watch_channels() -> Vec<DiscordWatchChannel> {
+    Vec::new()
+}
+fn default_discord_watch_banned_channel_names() -> Vec<String> {
+    vec!["omo".into(), "omo-help".into()]
+}
+fn default_gaebal_gajae_user_id() -> String {
+    String::new()
+}
+fn default_nudge_target_channel_id() -> Option<String> {
+    None
+}
+fn default_pending_mentions_threshold() -> u64 {
+    5
+}
+fn default_direct_mention_persist_ms() -> i64 {
+    180_000
+}
+fn default_channel_message_threshold() -> u64 {
+    100
+}
+fn default_discord_watch_global_cooldown_ms() -> i64 {
+    300_000
+}
+fn default_discord_watch_channel_cooldown_ms() -> i64 {
+    300_000
+}
+fn default_discord_watch_doctrine_template() -> String {
+    "UltraWorkers: <#{channel_id}> / {channel_name} 스윕하라. 기존 크론 독트린 기준으로 최근 메시지를 읽고 필요한 답변/액션만 수행하라.".into()
 }
 fn default_true() -> bool {
     true
@@ -641,6 +777,52 @@ impl AppConfig {
         self.webhook_route_count() > 0
     }
 
+    fn has_localfile_routes(&self) -> bool {
+        self.routes.iter().any(|route| {
+            route.effective_sink() == "localfile" && route.local_file_target().is_some()
+        })
+    }
+
+    fn has_discord_delivery_requiring_bot_token(&self) -> bool {
+        self.default_channel_can_fallback_to_discord()
+            || self.routes.iter().any(|route| {
+                route.effective_sink() == "discord" && route.discord_webhook_target().is_none()
+            })
+            || self.monitors.git.repos.iter().any(|repo| {
+                repo.channel
+                    .as_ref()
+                    .is_some_and(|channel| !channel.trim().is_empty())
+            })
+            || self.monitors.tmux.sessions.iter().any(|session| {
+                session
+                    .channel
+                    .as_ref()
+                    .is_some_and(|channel| !channel.trim().is_empty())
+            })
+            || self.monitors.workspace.iter().any(|workspace| {
+                workspace
+                    .channel
+                    .as_ref()
+                    .is_some_and(|channel| !channel.trim().is_empty())
+            })
+            || self.cron.jobs.iter().any(|job| {
+                job.channel
+                    .as_ref()
+                    .is_some_and(|channel| !channel.trim().is_empty())
+            })
+    }
+
+    fn default_channel_can_fallback_to_discord(&self) -> bool {
+        self.defaults
+            .channel
+            .as_ref()
+            .is_some_and(|channel| !channel.trim().is_empty())
+            && !self
+                .routes
+                .iter()
+                .any(|route| route.event.trim() == "*" && route.filter.is_empty())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.dispatch.ci_batch_window_secs == 0 {
             return Err("dispatch.ci_batch_window_secs must be at least 1".into());
@@ -648,10 +830,39 @@ impl AppConfig {
         if self.cron.poll_interval_secs == 0 {
             return Err("cron.poll_interval_secs must be at least 1".into());
         }
+        if self.discord_watch.enabled {
+            if self.discord_watch.gaebal_gajae_user_id.trim().is_empty() {
+                return Err(
+                    "discord_watch.gaebal_gajae_user_id is required when discord_watch is enabled"
+                        .into(),
+                );
+            }
+            for (index, channel) in self.discord_watch.watched_channels.iter().enumerate() {
+                if channel.id.trim().is_empty() || channel.name.trim().is_empty() {
+                    return Err(format!(
+                        "discord_watch.watched_channels[{index}] requires non-empty id and name"
+                    )
+                    .into());
+                }
+            }
+        }
+        if self.discord_watch.pending_mentions_threshold == 0 {
+            return Err("discord_watch.pending_mentions_threshold must be at least 1".into());
+        }
+        if self.discord_watch.direct_mention_persist_ms < 0 {
+            return Err("discord_watch.direct_mention_persist_ms must be non-negative".into());
+        }
+        if self.discord_watch.channel_message_threshold == 0 {
+            return Err("discord_watch.channel_message_threshold must be at least 1".into());
+        }
+        if self.discord_watch.global_cooldown_ms < 0 || self.discord_watch.channel_cooldown_ms < 0 {
+            return Err("discord_watch cooldowns must be non-negative".into());
+        }
 
         for (index, route) in self.routes.iter().enumerate() {
             let sink = route.effective_sink();
             let has_channel = normalize_secret(route.channel.clone()).is_some();
+            let has_thread = route.discord_thread_target().is_some();
             let has_discord_webhook = route.discord_webhook_target().is_some();
             let has_slack_webhook = route.slack_webhook_target().is_some();
             if route.sink.trim().is_empty() && !has_slack_webhook {
@@ -659,7 +870,7 @@ impl AppConfig {
                     format!("route #{} ({}) must set a sink", index + 1, route.event).into(),
                 );
             }
-            if !matches!(sink, "discord" | "slack") {
+            if !matches!(sink, "discord" | "slack" | "localfile") {
                 return Err(format!(
                     "route #{} ({}) uses unsupported sink '{}'",
                     index + 1,
@@ -671,9 +882,12 @@ impl AppConfig {
 
             match sink {
                 "discord" => {
-                    if has_channel && has_discord_webhook {
+                    let configured_targets = usize::from(has_channel)
+                        + usize::from(has_thread)
+                        + usize::from(has_discord_webhook);
+                    if configured_targets > 1 {
                         return Err(format!(
-                            "route #{} ({}) cannot set both channel and webhook",
+                            "route #{} ({}) must set only one Discord target: channel, thread, or webhook",
                             index + 1,
                             route.event
                         )
@@ -702,6 +916,24 @@ impl AppConfig {
                     if !has_slack_webhook {
                         return Err(format!(
                             "route #{} ({}) must set webhook or slack_webhook when sink = \"slack\"",
+                            index + 1,
+                            route.event
+                        )
+                        .into());
+                    }
+                }
+                "localfile" => {
+                    if has_channel || has_discord_webhook || has_slack_webhook {
+                        return Err(format!(
+                            "route #{} ({}) cannot set channel/webhook fields when sink = \"localfile\"",
+                            index + 1,
+                            route.event
+                        )
+                        .into());
+                    }
+                    if route.local_file_target().is_none() {
+                        return Err(format!(
+                            "route #{} ({}) must set local_path when sink = \"localfile\"",
                             index + 1,
                             route.event
                         )
@@ -744,11 +976,23 @@ impl AppConfig {
             }
         }
 
-        if self.effective_token().is_none() && !self.has_webhook_routes() {
-            return Err(
-                "missing Discord delivery config: configure [providers.discord].token (or legacy [discord].token) or at least one route webhook"
-                    .into(),
-            );
+        if self.effective_token().is_none() {
+            if self.has_discord_delivery_requiring_bot_token() {
+                return Err(
+                    "missing Discord bot token for configured Discord channel delivery; configure [providers.discord].token (or legacy [discord].token), use route webhooks, or remove Discord channel routes"
+                        .into(),
+                );
+            }
+
+            if !self.has_webhook_routes()
+                && !self.has_localfile_routes()
+                && !self.discord_watch.enabled
+            {
+                return Err(
+                    "missing Discord delivery config: configure [providers.discord].token (or legacy [discord].token), at least one route webhook, or a localfile route"
+                        .into(),
+                );
+            }
         }
 
         Ok(())
@@ -814,9 +1058,11 @@ impl AppConfig {
                     filter: BTreeMap::new(),
                     sink: default_sink_name(),
                     channel: None,
+                    thread: None,
                     channel_name: None,
                     webhook: Some(webhook),
                     slack_webhook: None,
+                    local_path: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -871,6 +1117,7 @@ impl AppConfig {
         match existing {
             Some(route) => {
                 route.channel = Some(channel_id);
+                route.thread = None;
                 route.channel_name = channel_name;
                 route.webhook = None;
             }
@@ -882,9 +1129,11 @@ impl AppConfig {
                     filter,
                     sink: default_sink_name(),
                     channel: Some(channel_id),
+                    thread: None,
                     channel_name,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -1071,6 +1320,30 @@ impl AppConfig {
             workspace.debounce_ms = workspace.debounce_ms.max(1);
             workspace.poll_interval_secs = workspace.poll_interval_secs.map(|secs| secs.max(1));
         }
+
+        self.discord_watch.gaebal_gajae_user_id =
+            normalize_text(Some(self.discord_watch.gaebal_gajae_user_id.clone()))
+                .unwrap_or_else(default_gaebal_gajae_user_id);
+        self.discord_watch.owner_user_ids = self
+            .discord_watch
+            .owner_user_ids
+            .iter()
+            .filter_map(|id| normalize_text(Some(id.clone())))
+            .collect();
+        self.discord_watch.banned_channel_ids = self
+            .discord_watch
+            .banned_channel_ids
+            .iter()
+            .filter_map(|id| normalize_text(Some(id.clone())))
+            .collect();
+        self.discord_watch.banned_channel_names = self
+            .discord_watch
+            .banned_channel_names
+            .iter()
+            .filter_map(|name| {
+                normalize_text(Some(name.trim_start_matches('#').to_ascii_lowercase()))
+            })
+            .collect();
 
         for job in &mut self.cron.jobs {
             job.id = normalize_text(Some(job.id.clone())).unwrap_or_default();
@@ -1267,10 +1540,56 @@ mod tests {
     }
 
     #[test]
+    fn load_or_default_parses_discord_thread_route_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[providers.discord]
+token = "bot-token"
+
+[[routes]]
+event = "session.*"
+sink = "discord"
+thread = "123456789012345678"
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(
+            config.routes[0].thread.as_deref(),
+            Some("123456789012345678")
+        );
+        assert_eq!(config.routes[0].channel, None);
+    }
+
+    #[test]
     fn webhook_route_satisfies_delivery_validation_without_bot_token() {
         let config = AppConfig {
             routes: vec![RouteRule {
                 event: "tmux.keyword".into(),
+                webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_ok(), "{:?}", config.validate().err());
+    }
+
+    #[test]
+    fn catch_all_webhook_with_default_channel_validates_without_bot_token() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "*".into(),
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
                 ..RouteRule::default()
             }],
@@ -1296,7 +1615,69 @@ mod tests {
     }
 
     #[test]
-    fn route_cannot_set_channel_and_webhook() {
+    fn localfile_only_route_satisfies_delivery_validation_without_bot_token() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "localfile".into(),
+                local_path: Some("/tmp/clawhip/events.jsonl".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn localfile_route_does_not_bypass_missing_token_for_discord_channel_route() {
+        let config = AppConfig {
+            routes: vec![
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    sink: "localfile".into(),
+                    local_path: Some("/tmp/clawhip/events.jsonl".into()),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "git.commit".into(),
+                    sink: "discord".into(),
+                    channel: Some("ops".into()),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("missing Discord bot token"));
+    }
+
+    #[test]
+    fn localfile_route_can_mix_with_discord_webhook_without_bot_token() {
+        let config = AppConfig {
+            routes: vec![
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    sink: "localfile".into(),
+                    local_path: Some("/tmp/clawhip/events.jsonl".into()),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "git.commit".into(),
+                    sink: "discord".into(),
+                    webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn discord_route_cannot_set_multiple_targets() {
         let config = AppConfig {
             providers: ProvidersConfig {
                 discord: DiscordConfig {
@@ -1309,7 +1690,7 @@ mod tests {
                 event: "tmux.keyword".into(),
                 sink: default_sink_name(),
                 channel: Some("123".into()),
-                webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
+                thread: Some("456".into()),
                 slack_webhook: None,
                 ..RouteRule::default()
             }],
@@ -1317,7 +1698,7 @@ mod tests {
         };
 
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("cannot set both channel and webhook"));
+        assert!(error.contains("only one Discord target"));
     }
 
     #[test]
@@ -1865,5 +2246,81 @@ poll_interval_secs = 9
         let config = AppConfig::load_or_default(&path).unwrap();
         assert!(config.monitors.workspace.is_empty());
         assert!(config.validate().is_ok());
+    }
+    #[test]
+    fn default_discord_watch_config_is_empty_and_omitted_from_pretty_toml() {
+        let config = AppConfig::default();
+
+        assert!(config.discord_watch.is_empty());
+        let toml = config.to_pretty_toml().expect("serialize default config");
+        assert!(
+            !toml.contains("[discord_watch]"),
+            "default local-only watch config should not change generated config shape"
+        );
+        let round_tripped: AppConfig = toml::from_str(&toml).expect("round-trip default config");
+        assert!(round_tripped.discord_watch.is_empty());
+    }
+
+    #[test]
+    fn discord_watch_defaults_are_backward_compatible_and_local_only() {
+        let config: AppConfig =
+            toml::from_str("[[routes]]\nevent = \"custom\"\nsink = \"localfile\"\nlocal_path = \"/tmp/clawhip/events.jsonl\"\n").expect("old config parses");
+        assert!(!config.discord_watch.enabled);
+        assert!(config.discord_watch.watched_channels.is_empty());
+        assert!(config.discord_watch.gaebal_gajae_user_id.is_empty());
+        assert!(config.discord_watch.nudge_target_channel_id.is_none());
+        assert!(
+            config
+                .discord_watch
+                .banned_channel_names
+                .contains(&"omo".to_string())
+        );
+        assert!(
+            config
+                .discord_watch
+                .banned_channel_names
+                .contains(&"omo-help".to_string())
+        );
+        assert_eq!(config.discord_watch.pending_mentions_threshold, 5);
+        assert_eq!(config.discord_watch.direct_mention_persist_ms, 180_000);
+        assert_eq!(config.discord_watch.channel_message_threshold, 100);
+        assert!(config.validate().is_ok(), "{:?}", config.validate().err());
+    }
+
+    #[test]
+    fn discord_watch_config_parses_without_discord_delivery_requirements() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[discord_watch]
+enabled = true
+gaebal_gajae_user_id = "fixture-gaebal"
+owner_user_ids = ["fixture-owner"]
+channel_cooldown_ms = 60000
+global_cooldown_ms = 60000
+[[discord_watch.watched_channels]]
+id = "fixture-general"
+name = "general"
+"#,
+        )
+        .expect("discord_watch config");
+        assert!(config.discord_watch.enabled);
+        assert_eq!(config.discord_watch.owner_user_ids, vec!["fixture-owner"]);
+        assert!(
+            config.validate().is_ok(),
+            "local-only watch must not require a bot token or route"
+        );
+    }
+
+    #[test]
+    fn discord_watch_custom_tuning_is_preserved_in_pretty_toml() {
+        let mut config = AppConfig::default();
+        config.discord_watch.pending_mentions_threshold = 7;
+        config.discord_watch.doctrine_template = "Sweep <#{channel_id}>".into();
+
+        let toml = config.to_pretty_toml().expect("serialize config");
+
+        assert!(toml.contains("[discord_watch]"));
+        assert!(toml.contains("pending_mentions_threshold = 7"));
+        assert!(toml.contains("doctrine_template = \"Sweep <#{channel_id}>\""));
     }
 }

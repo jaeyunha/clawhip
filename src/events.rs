@@ -8,6 +8,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::Result;
+use crate::discord_watch::DiscordMessageCreateEvent;
 use crate::render::{DefaultRenderer, Renderer};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, ValueEnum)]
@@ -519,6 +520,18 @@ impl IncomingEvent {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn discord_message_create(message: DiscordMessageCreateEvent) -> Self {
+        Self {
+            kind: "discord.message-create".to_string(),
+            channel: Some(message.channel_id.clone()),
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!(message),
+        }
+    }
+
     pub fn tmux_keyword(
         session: String,
         keyword: String,
@@ -656,6 +669,9 @@ impl IncomingEvent {
     pub fn canonical_kind(&self) -> &str {
         match self.kind.as_str() {
             "issue-opened" => "github.issue-opened",
+            "discord.message_create" | "discord.message.created" | "discord.message-create" => {
+                "discord.message-create"
+            }
             "git.pr-status-changed" => "github.pr-status-changed",
             "session-start" | "started" => "session.started",
             "session-idle" | "blocked" => "session.blocked",
@@ -2231,5 +2247,33 @@ mod tests {
             assert_eq!(event.payload["status"], json!(expected_status));
             assert_eq!(event.payload["normalized_event"], json!(expected_status));
         }
+    }
+
+    #[test]
+    fn normalize_event_maps_question_requested_to_session_blocked() {
+        let event = normalize_event(IncomingEvent {
+            kind: "question.requested".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "tool": "codex",
+                "agent_name": "codex",
+                "session_id": "sess-234",
+                "repo_name": "clawhip",
+                "tool_name": "ask_user_question",
+                "route_key": "question.requested",
+                "question_summary": "Approve the deploy?",
+                "summary": "Approve the deploy?"
+            }),
+        });
+
+        assert_eq!(event.kind, "session.blocked");
+        assert_eq!(event.payload["raw_event"], json!("question.requested"));
+        assert_eq!(event.payload["contract_event"], json!("session.blocked"));
+        assert_eq!(event.payload["status"], json!("blocked"));
+        assert_eq!(event.payload["normalized_event"], json!("blocked"));
+        assert_eq!(event.payload["summary"], json!("Approve the deploy?"));
     }
 }

@@ -142,9 +142,9 @@ pub async fn deliver(config: &PromptDeliverConfig) -> Result<DeliveryResult> {
         mut pane,
         hook_setup,
         provider,
+        effective_workdir,
     } = wait_until_pane_ready(config).await?;
-    let marker_path = effective_marker_path(&hook_setup, &pane.cwd);
-    let effective_workdir = effective_workdir(&hook_setup, &pane.cwd);
+    let marker_path = effective_workdir.join(PROMPT_SUBMIT_MARKER);
 
     // wait_until_pane_ready guarantees a resolved pane and provider, but the
     // provider's prompt UI may still be redrawing. Give the TUI a short grace
@@ -200,6 +200,7 @@ struct ReadyState {
     pane: PaneTarget,
     hook_setup: HookSetup,
     provider: ProviderKind,
+    effective_workdir: PathBuf,
 }
 
 /// Poll the existing readiness chain (tmux pane resolve → hook detect →
@@ -260,11 +261,19 @@ async fn try_resolve_ready(
             return Err("active-provider".into());
         }
     };
+    let effective_workdir = match effective_workdir(&hook_setup, &pane.cwd) {
+        Ok(workdir) => workdir,
+        Err(err) => {
+            *last_failure = ReadinessFailure::new("workdir", err.to_string(), Some(pane.clone()));
+            return Err("workdir".into());
+        }
+    };
 
     Ok(ReadyState {
         pane,
         hook_setup,
         provider,
+        effective_workdir,
     })
 }
 
@@ -386,11 +395,15 @@ fn detect_hook_setup(cwd: &Path) -> Result<HookSetup> {
         return Ok(setup);
     }
 
-    Err(format!(
+    Err(non_repo_delivery_error(cwd))
+}
+
+fn non_repo_delivery_error(cwd: &Path) -> crate::DynError {
+    format!(
         "refusing delivery: '{}' is not inside a repo/workdir with prompt-submit-aware hook setup, and no global ~/.codex / ~/.claude clawhip hook install was detected",
         cwd.display()
     )
-    .into())
+    .into()
 }
 
 fn hook_setup_at(root: &Path, install_scope: HookDetectionScope) -> Option<HookSetup> {
@@ -783,16 +796,18 @@ fn ensure_global_workdir_marker(marker_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn effective_workdir(hook_setup: &HookSetup, pane_cwd: &Path) -> PathBuf {
+fn effective_workdir(hook_setup: &HookSetup, pane_cwd: &Path) -> Result<PathBuf> {
     if hook_setup.install_scope != HookDetectionScope::Global {
-        return hook_setup.workdir.clone();
+        return Ok(hook_setup.workdir.clone());
     }
 
-    infer_worktree_root(pane_cwd).unwrap_or_else(|| pane_cwd.to_path_buf())
-}
-
-fn effective_marker_path(hook_setup: &HookSetup, pane_cwd: &Path) -> PathBuf {
-    effective_workdir(hook_setup, pane_cwd).join(PROMPT_SUBMIT_MARKER)
+    infer_worktree_root(pane_cwd).ok_or_else(|| {
+        format!(
+            "refusing delivery: '{}' is not inside a repo/workdir; global hook install is available but prompt delivery requires a git repo/workdir cwd",
+            pane_cwd.display()
+        )
+        .into()
+    })
 }
 
 fn infer_worktree_root(directory: &Path) -> Option<PathBuf> {
@@ -1252,6 +1267,7 @@ mod tests {
         let fake_home = tempdir.path().join("home");
         let repo = fake_home.join("dev/myrepo");
         let nested = repo.join("src/bin");
+        init_git_repo_for_prompt_delivery_test(&repo);
         fs::create_dir_all(fake_home.join(".codex")).expect("create codex dir");
         fs::create_dir_all(fake_home.join(".clawhip/hooks")).expect("create hook dir");
         fs::create_dir_all(&nested).expect("create nested dir");
@@ -1286,9 +1302,12 @@ mod tests {
         assert_eq!(setup.workdir, fake_home);
         assert!(setup.supported_providers.contains(&ProviderKind::Omx));
 
-        let marker = effective_marker_path(&setup, &nested);
+        let canonical_repo = repo.canonicalize().expect("canonicalize repo");
+        let marker = effective_workdir(&setup, &nested)
+            .expect("effective workdir")
+            .join(PROMPT_SUBMIT_MARKER);
         assert!(
-            marker.starts_with(&nested) || marker.starts_with(&repo),
+            marker.starts_with(&canonical_repo),
             "marker {} must resolve under pane_cwd, not $HOME",
             marker.display()
         );
@@ -1316,6 +1335,7 @@ mod tests {
         let fake_home = tempdir.path().join("home");
         let repo = fake_home.join("dev/myrepo");
         let nested = repo.join("src/bin");
+        init_git_repo_for_prompt_delivery_test(&repo);
         fs::create_dir_all(fake_home.join(".claude")).expect("create claude dir");
         fs::create_dir_all(fake_home.join(".clawhip/hooks")).expect("create hook dir");
         fs::create_dir_all(&nested).expect("create nested dir");
@@ -1350,9 +1370,12 @@ mod tests {
         assert_eq!(setup.workdir, fake_home);
         assert!(setup.supported_providers.contains(&ProviderKind::Omc));
 
-        let marker = effective_marker_path(&setup, &nested);
+        let canonical_repo = repo.canonicalize().expect("canonicalize repo");
+        let marker = effective_workdir(&setup, &nested)
+            .expect("effective workdir")
+            .join(PROMPT_SUBMIT_MARKER);
         assert!(
-            marker.starts_with(&nested) || marker.starts_with(&repo),
+            marker.starts_with(&canonical_repo),
             "marker {} must resolve under pane_cwd, not $HOME",
             marker.display()
         );
@@ -1444,6 +1467,7 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let workdir = tempdir.path().join("repo");
         let fake_home = tempdir.path().join("home");
+        init_git_repo_for_prompt_delivery_test(&workdir);
         fs::create_dir_all(fake_home.join(".codex")).expect("create codex dir");
         fs::create_dir_all(fake_home.join(".clawhip/hooks")).expect("create hook dir");
         let command = format!(
@@ -1532,6 +1556,7 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let workdir = tempdir.path().join("repo");
         let fake_home = tempdir.path().join("home");
+        init_git_repo_for_prompt_delivery_test(&workdir);
         fs::create_dir_all(fake_home.join(".codex")).expect("create codex dir");
         fs::create_dir_all(fake_home.join(".clawhip/hooks")).expect("create hook dir");
         let command = format!(
@@ -1618,5 +1643,19 @@ mod tests {
     fn shell_escape_path(path: &Path) -> String {
         let value = path.display().to_string();
         format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    fn init_git_repo_for_prompt_delivery_test(path: &Path) {
+        fs::create_dir_all(path).expect("create repo dir");
+        let output = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(path)
+            .output()
+            .expect("run git init");
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

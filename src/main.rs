@@ -6,15 +6,20 @@ mod core;
 mod cron;
 mod daemon;
 mod discord;
+mod discord_watch;
 mod dispatch;
 mod dynamic_tokens;
 mod event;
 mod events;
+mod gajae;
+mod gateway_allowlist;
 mod hooks;
 mod keyword_window;
+mod ledger;
 mod lifecycle;
 mod memory;
 mod native_hooks;
+mod native_observability;
 mod plugins;
 mod provenance;
 mod release_preflight;
@@ -23,35 +28,57 @@ mod router;
 mod sink;
 mod slack;
 mod source;
+mod telemetry;
 mod tmux_wrapper;
 mod update;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use clap::Parser;
+use tokio::runtime::Builder;
 
 use crate::cli::{
-    AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs, GitCommands,
-    GithubCommands, HooksCommands, MemoryCommands, NativeCommands, PluginCommands, ReleaseCommands,
-    SetupArgs, TmuxCommands, UpdateCommands, VerifyBindingsArgs,
+    AgentCommands, Cli, Commands, ConfigCommand, CronCommands, ExplainArgs, GajaeCommands,
+    GajaeProfileCommands, GitCommands, GithubCommands, HooksCommands, LaneCommands, MemoryCommands,
+    NativeCommands, PluginCommands, ReleaseCommands, SetupArgs, TmuxCommands, UpdateCommands,
+    VerifyBindingsArgs, VerifyGatewayAllowlistArgs,
 };
 use crate::client::DaemonClient;
 use crate::config::{AppConfig, SetupEdits};
 use crate::discord::DiscordClient;
 use crate::event::compat::from_incoming_event;
-use crate::events::IncomingEvent;
+use crate::events::{IncomingEvent, RoutingMetadata};
+use crate::source::tmux::RegisteredTmuxSession;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, DynError>;
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = real_main().await {
+fn main() {
+    let cli = Cli::parse();
+    let runtime = match build_runtime(&cli) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("clawhip error: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(error) = runtime.block_on(real_main(cli)) {
         eprintln!("clawhip error: {error}");
         std::process::exit(1);
     }
+}
+
+fn build_runtime(cli: &Cli) -> Result<tokio::runtime::Runtime> {
+    let mut builder = Builder::new_multi_thread();
+    builder.enable_all();
+    if let Some(worker_threads) = cli.runtime_worker_threads() {
+        builder.worker_threads(worker_threads);
+    }
+    Ok(builder.build()?)
 }
 
 fn prepare_event(event: IncomingEvent) -> Result<IncomingEvent> {
@@ -60,14 +87,16 @@ fn prepare_event(event: IncomingEvent) -> Result<IncomingEvent> {
     Ok(event)
 }
 
-async fn real_main() -> Result<()> {
-    let cli = Cli::parse();
+async fn real_main(cli: Cli) -> Result<()> {
     let config_path = cli.config_path();
     let config = Arc::new(AppConfig::load_or_default(&config_path)?);
     let cron_state_path = crate::cron::default_state_path(&config_path);
 
-    match cli.command.unwrap_or(Commands::Start { port: None }) {
-        Commands::Start { port } => daemon::run(config, port, cron_state_path).await,
+    match cli.command.unwrap_or(Commands::Start {
+        port: None,
+        worker_threads: None,
+    }) {
+        Commands::Start { port, .. } => daemon::run(config, port, cron_state_path).await,
         Commands::Status => {
             let client = DaemonClient::from_config(config.as_ref());
             let health = client.health().await?;
@@ -253,6 +282,116 @@ async fn real_main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Lane { command } => match command {
+            LaneCommands::Board(args) => {
+                let rows = load_lane_rows(config.as_ref(), LaneSnapshotMode::BestEffort).await?;
+                render_lane_board(&rows, args.json)?;
+                Ok(())
+            }
+            LaneCommands::Reconcile(args) => {
+                let ledger = ledger::Ledger::open_default()?;
+                let rows = load_lane_rows(config.as_ref(), LaneSnapshotMode::Strict).await?;
+                for row in &rows {
+                    if ledger.session_by_name(&row.session)?.is_none() {
+                        if row.status == ledger::LaneStatus::UnknownTmux {
+                            ledger.upsert_session(manual_session_input(
+                                &row.session,
+                                ledger::SessionState::Unknown,
+                            ))?;
+                        } else {
+                            continue;
+                        }
+                    }
+                    let state = match row.status {
+                        ledger::LaneStatus::HealthyAgent
+                        | ledger::LaneStatus::ExternallyWatched => ledger::SessionState::Healthy,
+                        ledger::LaneStatus::LostMonitoring => ledger::SessionState::LostMonitoring,
+                        ledger::LaneStatus::IgnoredInfra => ledger::SessionState::IgnoredAlive,
+                        ledger::LaneStatus::DeadSession => ledger::SessionState::Dead,
+                        ledger::LaneStatus::UnknownTmux => ledger::SessionState::Unknown,
+                    };
+                    ledger.set_session_state(&row.session, state)?;
+                }
+                let rows = load_lane_rows(config.as_ref(), LaneSnapshotMode::Strict).await?;
+                render_lane_board(&rows, args.json)?;
+                Ok(())
+            }
+            LaneCommands::Ignore(args) => {
+                let ledger = ledger::Ledger::open_default()?;
+                let rows = load_lane_rows(config.as_ref(), LaneSnapshotMode::Strict).await?;
+                let row = rows
+                    .iter()
+                    .find(|row| row.session == args.session)
+                    .ok_or_else(|| {
+                        format!(
+                            "session '{}' is not visible in tmux or ledger",
+                            args.session
+                        )
+                    })?;
+                if !row.live_tmux {
+                    return Err(format!(
+                        "cannot ignore '{}': tmux session is not live",
+                        args.session
+                    )
+                    .into());
+                }
+                if row.expected_watch
+                    || row.spawned_by_clawhip
+                    || row.kind == ledger::SessionKind::Agent
+                {
+                    return Err(format!(
+                        "cannot ignore '{}': lane is clawhip-managed; restore or reconcile it instead",
+                        args.session
+                    )
+                    .into());
+                }
+                if ledger.session_by_name(&args.session)?.is_none() {
+                    ledger.upsert_session(manual_session_input(
+                        &args.session,
+                        ledger::SessionState::IgnoredAlive,
+                    ))?;
+                }
+                let session = ledger.mark_ignored(&args.session)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&session)?);
+                } else {
+                    println!("Ignored lane {}", session.tmux_session);
+                }
+                Ok(())
+            }
+            LaneCommands::Restore(args) => {
+                let ledger = ledger::Ledger::open_default()?;
+                let intent = ledger
+                    .watch_intent_for_session(&args.session)?
+                    .ok_or_else(|| {
+                        format!("no saved watch intent for session '{}'", args.session)
+                    })?;
+                if args.apply {
+                    let session = ledger
+                        .session_by_name(&args.session)?
+                        .ok_or_else(|| format!("no saved session for '{}'", args.session))?;
+                    let registration = registration_from_lane_restore(&session, &intent);
+                    let client = DaemonClient::from_config(config.as_ref());
+                    client.register_tmux(&registration).await?;
+                    ledger.record_registration(&registration, session.spawned_by_clawhip)?;
+                }
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "intent": intent,
+                            "applied": args.apply,
+                        }))?
+                    );
+                } else {
+                    println!("{}", intent.restore_command_string());
+                    if args.apply {
+                        println!("Re-registered {}", args.session);
+                    }
+                }
+                Ok(())
+            }
+        },
         Commands::Native { command } => match command {
             NativeCommands::Hook(args) => {
                 let client = DaemonClient::from_config(config.as_ref());
@@ -295,6 +434,9 @@ async fn real_main() -> Result<()> {
                 Ok(())
             }
             ConfigCommand::VerifyBindings(args) => run_verify_bindings(config, args).await,
+            ConfigCommand::VerifyGatewayAllowlist(args) => {
+                run_verify_gateway_allowlist(config, args)
+            }
         },
         Commands::Plugin { command } => match command {
             PluginCommands::List => {
@@ -324,6 +466,23 @@ async fn real_main() -> Result<()> {
         },
         Commands::Hooks { command } => match command {
             HooksCommands::Install(args) => hooks::install(args),
+        },
+        Commands::Gajae { command } => match command {
+            GajaeCommands::Status => Ok(gajae::run(gajae::GajaeCommand::Status)?),
+            GajaeCommands::Profile { command } => match command {
+                GajaeProfileCommands::Install => {
+                    let status = gajae::run_profile_install()?;
+                    if status.success {
+                        Ok(())
+                    } else {
+                        eprintln!(
+                            "clawhip error: {}",
+                            gajae::profile_install_failure_message(status)
+                        );
+                        std::process::exit(status.code.unwrap_or(1));
+                    }
+                }
+            },
         },
         Commands::Release { command } => match command {
             ReleaseCommands::Preflight { version, repo } => release_preflight::run(repo, version),
@@ -487,6 +646,31 @@ async fn run_verify_bindings(config: Arc<AppConfig>, args: VerifyBindingsArgs) -
     Ok(())
 }
 
+fn run_verify_gateway_allowlist(
+    config: Arc<AppConfig>,
+    args: VerifyGatewayAllowlistArgs,
+) -> Result<()> {
+    let gateway_config_path = match args.gateway_config {
+        Some(path) => path,
+        None => gateway_allowlist::default_gateway_config_path().ok_or_else(|| {
+            "could not resolve default gateway config path; pass --gateway-config <path>"
+                .to_string()
+        })?,
+    };
+    let report = gateway_allowlist::verify_from_path(&config, &gateway_config_path)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{report}");
+    }
+
+    if !report.all_ok() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn run_explain(config: &AppConfig, args: ExplainArgs) -> Result<()> {
     let json_output = args.json;
     // Only normalize the event (for canonical_kind / template_context), skip
@@ -507,6 +691,129 @@ fn run_explain(config: &AppConfig, args: ExplainArgs) -> Result<()> {
 
 fn render_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) {
     print!("{}", format_tmux_list(registrations));
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LaneSnapshotMode {
+    BestEffort,
+    Strict,
+}
+
+async fn load_lane_rows(
+    config: &AppConfig,
+    mode: LaneSnapshotMode,
+) -> Result<Vec<ledger::LaneRow>> {
+    let ledger = ledger::Ledger::open_default()?;
+    let sessions = ledger.sessions()?;
+    let intents = ledger.watch_intents()?;
+    let client = DaemonClient::from_config(config);
+    let registrations = match client.list_tmux().await {
+        Ok(registrations) => registrations,
+        Err(error) if matches!(mode, LaneSnapshotMode::BestEffort) => {
+            eprintln!("clawhip lane board warning: daemon tmux registry unavailable: {error}");
+            Vec::new()
+        }
+        Err(error) => return Err(error),
+    };
+    let live_tmux_sessions = match crate::source::tmux::list_tmux_sessions().await {
+        Ok(sessions) => sessions.into_iter().collect::<BTreeSet<_>>(),
+        Err(error) if matches!(mode, LaneSnapshotMode::BestEffort) => {
+            eprintln!("clawhip lane board warning: tmux session inventory unavailable: {error}");
+            BTreeSet::new()
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(ledger::classify_lanes(
+        &sessions,
+        &intents,
+        &registrations,
+        &live_tmux_sessions,
+    ))
+}
+
+fn render_lane_board(rows: &[ledger::LaneRow], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(rows)?);
+    } else {
+        print!("{}", format_lane_board(rows));
+    }
+    Ok(())
+}
+
+fn format_lane_board(rows: &[ledger::LaneRow]) -> String {
+    if rows.is_empty() {
+        return "No clawhip lanes found\n".to_string();
+    }
+
+    let mut output =
+        "SESSION\tSTATUS\tKIND\tOWNER\tSPAWNED\tSOURCE\tLIVE_TMUX\tDAEMON_WATCH\tRESTORE\tCHANNEL\tREPO\tBRANCH\n"
+            .to_string();
+    for row in rows {
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            row.session,
+            row.status.as_str(),
+            row.kind.as_str(),
+            row.owner.as_str(),
+            bool_label(row.spawned_by_clawhip),
+            row.registration_source
+                .map(|source| source.as_str())
+                .unwrap_or("-"),
+            bool_label(row.live_tmux),
+            bool_label(row.daemon_watch),
+            bool_label(row.has_restore),
+            row.channel.as_deref().unwrap_or("-"),
+            row.repo_name.as_deref().unwrap_or("-"),
+            row.branch.as_deref().unwrap_or("-"),
+        ));
+    }
+    output
+}
+
+fn bool_label(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn manual_session_input(session: &str, state: ledger::SessionState) -> ledger::SessionInput {
+    ledger::SessionInput {
+        tmux_session: session.to_string(),
+        tmux_pane: None,
+        kind: ledger::SessionKind::Unknown,
+        owner: ledger::SessionOwner::Unknown,
+        project_path: None,
+        repo_name: None,
+        branch: None,
+        spawned_by_clawhip: false,
+        expected_watch: false,
+        state,
+        last_seen_at: Some(crate::source::tmux::current_timestamp_rfc3339()),
+    }
+}
+
+fn registration_from_lane_restore(
+    session: &ledger::SessionRecord,
+    intent: &ledger::WatchIntentRecord,
+) -> RegisteredTmuxSession {
+    RegisteredTmuxSession {
+        session: session.tmux_session.clone(),
+        channel: intent.channel.clone(),
+        mention: intent.mention.clone(),
+        routing: RoutingMetadata {
+            repo_name: session.repo_name.clone(),
+            project: session.repo_name.clone(),
+            worktree_path: session.project_path.clone(),
+            branch: session.branch.clone(),
+            ..RoutingMetadata::default()
+        },
+        keywords: intent.keywords.clone(),
+        keyword_window_secs: 30,
+        stale_minutes: intent.stale_minutes,
+        format: intent.format.clone(),
+        registered_at: crate::source::tmux::current_timestamp_rfc3339(),
+        registration_source: intent.registration_source,
+        parent_process: None,
+        active_wrapper_monitor: false,
+    }
 }
 
 fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> String {
@@ -550,8 +857,9 @@ fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> S
 
 #[cfg(test)]
 mod tests {
-    use super::{format_tmux_list, parse_expect_name_overrides};
+    use super::{format_lane_board, format_tmux_list, parse_expect_name_overrides};
     use crate::events::RoutingMetadata;
+    use crate::ledger::{LaneRow, LaneStatus, SessionKind, SessionOwner, SessionState};
     use crate::source::tmux::{ParentProcessInfo, RegisteredTmuxSession, RegistrationSource};
 
     #[test]
@@ -668,5 +976,33 @@ mod tests {
     #[test]
     fn format_tmux_list_handles_empty_registry() {
         assert_eq!(format_tmux_list(&[]), "No active tmux watches found\n");
+    }
+
+    #[test]
+    fn format_lane_board_renders_classification_columns() {
+        let output = format_lane_board(&[LaneRow {
+            session: "agent-1".into(),
+            status: LaneStatus::LostMonitoring,
+            kind: SessionKind::Agent,
+            owner: SessionOwner::Walter,
+            state: SessionState::LostMonitoring,
+            spawned_by_clawhip: true,
+            expected_watch: true,
+            registration_source: Some(RegistrationSource::CliNew),
+            live_tmux: true,
+            daemon_watch: false,
+            has_restore: true,
+            channel: Some("alerts".into()),
+            repo_name: Some("forever-agent".into()),
+            branch: Some("main".into()),
+            restore_command: Some("clawhip tmux watch --session agent-1".into()),
+        }]);
+
+        assert!(output.contains(
+            "SESSION\tSTATUS\tKIND\tOWNER\tSPAWNED\tSOURCE\tLIVE_TMUX\tDAEMON_WATCH\tRESTORE\tCHANNEL\tREPO\tBRANCH"
+        ));
+        assert!(output.contains(
+            "agent-1\tlost-monitoring\tagent\twalter\tyes\tcli-new\tyes\tno\tyes\talerts\tforever-agent\tmain"
+        ));
     }
 }

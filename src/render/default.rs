@@ -263,21 +263,24 @@ impl Renderer for DefaultRenderer {
             ) => serde_json::to_string_pretty(payload)?,
 
             ("tmux.keyword", MessageFormat::Compact) => format!(
-                "tmux:{} matched '{}' => {}",
+                "tmux:{} matched '{}' => {}{}",
                 string_field(payload, "session")?,
                 string_field(payload, "keyword")?,
-                string_field(payload, "line")?
+                string_field(payload, "line")?,
+                tmux_keyword_provenance_suffix(payload)
             ),
             ("tmux.keyword", MessageFormat::Alert) => format!(
-                "🚨 tmux session {} hit keyword '{}': {}",
+                "🚨 tmux session {} hit keyword '{}': {}{}",
                 string_field(payload, "session")?,
                 string_field(payload, "keyword")?,
-                string_field(payload, "line")?
+                string_field(payload, "line")?,
+                tmux_keyword_provenance_suffix(payload)
             ),
             ("tmux.keyword", MessageFormat::Inline) => format!(
-                "[tmux:{}] {}",
+                "[tmux:{}] {}{}",
                 string_field(payload, "session")?,
-                string_field(payload, "line")?
+                string_field(payload, "line")?,
+                tmux_keyword_provenance_suffix(payload)
             ),
             ("tmux.keyword", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
 
@@ -332,19 +335,6 @@ fn optional_string_field(payload: &Value, key: &str) -> Option<String> {
 
 fn optional_u64_field(payload: &Value, key: &str) -> Option<u64> {
     payload.get(key).and_then(Value::as_u64)
-}
-
-fn optional_bool_field(payload: &Value, key: &str) -> Option<bool> {
-    match payload.get(key) {
-        Some(Value::Bool(value)) => Some(*value),
-        Some(Value::Number(value)) => value.as_u64().map(|number| number != 0),
-        Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "attached" => Some(true),
-            "0" | "false" | "no" | "detached" => Some(false),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 fn agent_optional_mention_prefix(payload: &Value) -> String {
@@ -472,22 +462,6 @@ fn session_detail_suffix(payload: &Value) -> String {
     if let Some(error_message) = optional_string_field(payload, "error_message") {
         parts.push(format!("error={error_message}"));
     }
-    if let Some(tmux_identity) = tmux_identity(payload) {
-        parts.push(format!("tmux={tmux_identity}"));
-    }
-    if let Some(tmux_pane_tty) = optional_string_field(payload, "tmux_pane_tty") {
-        parts.push(format!("pane_tty={tmux_pane_tty}"));
-    }
-    if let Some(tmux_client_count) = optional_u64_field(payload, "tmux_client_count") {
-        parts.push(format!("clients={tmux_client_count}"));
-    }
-    if let Some(tmux_attached) = optional_bool_field(payload, "tmux_attached") {
-        parts.push(if tmux_attached {
-            "attached".to_string()
-        } else {
-            "detached".to_string()
-        });
-    }
 
     if parts.is_empty() {
         String::new()
@@ -525,46 +499,11 @@ fn session_inline_suffix(payload: &Value) -> String {
     if let Some(error_message) = optional_string_field(payload, "error_message") {
         parts.push(format!("error: {error_message}"));
     }
-    if let Some(tmux_identity) = tmux_identity(payload) {
-        parts.push(format!("tmux {tmux_identity}"));
-    }
-    if let Some(tmux_pane_tty) = optional_string_field(payload, "tmux_pane_tty") {
-        parts.push(tmux_pane_tty);
-    }
-    if let Some(tmux_client_count) = optional_u64_field(payload, "tmux_client_count") {
-        parts.push(format!("{tmux_client_count} clients"));
-    }
-    if let Some(tmux_attached) = optional_bool_field(payload, "tmux_attached") {
-        parts.push(if tmux_attached {
-            "attached".to_string()
-        } else {
-            "detached".to_string()
-        });
-    }
 
     if parts.is_empty() {
         String::new()
     } else {
         format!(" · {}", parts.join(" · "))
-    }
-}
-
-fn tmux_identity(payload: &Value) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(session) = optional_string_field(payload, "tmux_session") {
-        parts.push(session);
-    }
-    if let Some(window) = optional_string_field(payload, "tmux_window") {
-        parts.push(window);
-    }
-    if let Some(pane) = optional_string_field(payload, "tmux_pane") {
-        parts.push(pane);
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(":"))
     }
 }
 
@@ -795,6 +734,31 @@ fn render_aggregated_git_commit(payload: &Value, format: &MessageFormat) -> Resu
     Ok(Some(lines.join("\n")))
 }
 
+fn tmux_keyword_provenance_suffix(payload: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(pane_id) = payload.get("pane_id").and_then(Value::as_str) {
+        let pane_name = payload.get("pane_name").and_then(Value::as_str);
+        match pane_name {
+            Some(pane_name) if !pane_name.is_empty() => {
+                parts.push(format!("pane {pane_id}/{pane_name}"));
+            }
+            _ => parts.push(format!("pane {pane_id}")),
+        }
+    }
+    if let Some(cursor) = payload.get("cursor").and_then(Value::as_u64) {
+        parts.push(format!("cursor {cursor}"));
+    }
+    if let Some(source) = payload.get("source").and_then(Value::as_str) {
+        parts.push(source.to_string());
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
 fn render_aggregated_tmux_keyword(
     payload: &Value,
     format: &MessageFormat,
@@ -818,7 +782,10 @@ fn render_aggregated_tmux_keyword(
             if keyword.is_empty() || line.is_empty() {
                 None
             } else {
-                Some(format!("'{keyword}': {line}"))
+                Some(format!(
+                    "'{keyword}': {line}{}",
+                    tmux_keyword_provenance_suffix(hit)
+                ))
             }
         })
         .collect::<Vec<_>>();
@@ -950,40 +917,25 @@ mod tests {
     }
 
     #[test]
-    fn renders_session_events_with_tmux_metadata() {
-        let event = IncomingEvent {
-            kind: "session.started".into(),
-            channel: None,
-            mention: None,
-            format: None,
-            template: None,
-            payload: json!({
-                "tool": "codex",
-                "session_name": "issue-180",
-                "repo_name": "clawhip",
-                "tmux_session": "issue-180",
-                "tmux_window": "2",
-                "tmux_pane": "%11",
-                "tmux_pane_tty": "/dev/pts/42",
-                "tmux_attached": false,
-                "tmux_client_count": 0
-            }),
-        };
-
-        let compact = DefaultRenderer
-            .render(&event, &MessageFormat::Compact)
-            .unwrap();
-        let inline = DefaultRenderer
-            .render(&event, &MessageFormat::Inline)
-            .unwrap();
-
-        assert_eq!(
-            compact,
-            "codex issue-180 started (repo=clawhip, tmux=issue-180:2:%11, pane_tty=/dev/pts/42, clients=0, detached)"
+    fn renders_tmux_keyword_provenance_when_present() {
+        let mut event = IncomingEvent::tmux_keyword(
+            "issue-220".into(),
+            "ERROR_READY".into(),
+            "ERROR_READY".into(),
+            None,
         );
+        event.payload["pane_id"] = json!("%3");
+        event.payload["pane_name"] = json!("0.1");
+        event.payload["cursor"] = json!(42);
+        event.payload["source"] = json!("fresh-output");
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Alert)
+            .unwrap();
+
         assert_eq!(
-            inline,
-            "[codex issue-180] started · clawhip · tmux issue-180:2:%11 · /dev/pts/42 · 0 clients · detached"
+            rendered,
+            "🚨 tmux session issue-220 hit keyword 'ERROR_READY': ERROR_READY (pane %3/0.1, cursor 42, fresh-output)"
         );
     }
 

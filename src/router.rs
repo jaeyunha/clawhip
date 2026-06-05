@@ -15,6 +15,41 @@ use crate::sink::Sink;
 #[cfg(test)]
 use crate::sink::SinkMessage;
 use crate::sink::SinkTarget;
+use crate::telemetry;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteTrace {
+    pub result: RouteTraceResult,
+    pub matched_route_index: Option<usize>,
+    pub event_pattern: Option<String>,
+    pub filter_keys: Vec<String>,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTraceResult {
+    Matched,
+    Fallback,
+    None,
+}
+
+impl RouteTraceResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Matched => "matched",
+            Self::Fallback => "fallback",
+            Self::None => "none",
+        }
+    }
+
+    pub fn reason_code(self) -> &'static str {
+        match self {
+            Self::Matched => telemetry::reason::ROUTE_MATCHED,
+            Self::Fallback => telemetry::reason::ROUTE_FALLBACK,
+            Self::None => telemetry::reason::ROUTE_NONE,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDelivery {
@@ -24,6 +59,7 @@ pub struct ResolvedDelivery {
     pub mention: Option<String>,
     pub template: Option<String>,
     pub allow_dynamic_tokens: bool,
+    pub trace: RouteTrace,
 }
 
 pub struct Router {
@@ -48,6 +84,7 @@ impl Router {
                 format: delivery.format.clone(),
                 content,
                 payload: event.payload.clone(),
+                telemetry: None,
             };
             if let Err(error) = sink.send(&delivery.target, &message).await {
                 eprintln!(
@@ -61,16 +98,22 @@ impl Router {
     }
 
     pub async fn resolve(&self, event: &IncomingEvent) -> Result<Vec<ResolvedDelivery>> {
-        let routes = self.routes_for(event);
-        let routes = if routes.is_empty() {
-            vec![None]
-        } else {
-            routes.into_iter().map(Some).collect()
-        };
-        let mut deliveries = Vec::with_capacity(routes.len());
+        let context = event.template_context();
+        let matched_routes =
+            matching_routes_for(&self.config.routes, event.canonical_kind(), &context);
+        let mut deliveries = Vec::with_capacity(matched_routes.len().max(1));
 
-        for route in routes {
-            deliveries.push(self.resolve_delivery(event, route)?);
+        if matched_routes.is_empty() {
+            deliveries.push(self.resolve_delivery(event, None, None)?);
+        } else {
+            for route in matched_routes {
+                let index = self
+                    .config
+                    .routes
+                    .iter()
+                    .position(|candidate| std::ptr::eq(candidate, route));
+                deliveries.push(self.resolve_delivery(event, Some(route), index)?);
+            }
         }
 
         Ok(deliveries)
@@ -90,6 +133,7 @@ impl Router {
         &self,
         event: &IncomingEvent,
         route: Option<&RouteRule>,
+        matched_route_index: Option<usize>,
     ) -> Result<ResolvedDelivery> {
         let sink = route
             .map(RouteRule::effective_sink)
@@ -101,6 +145,22 @@ impl Router {
             .clone()
             .or_else(|| route.and_then(|route| route.format.clone()))
             .unwrap_or_else(|| self.config.defaults.format.clone());
+
+        let trace = RouteTrace {
+            result: if route.is_some() {
+                RouteTraceResult::Matched
+            } else if self.config.defaults.channel.is_some() {
+                RouteTraceResult::Fallback
+            } else {
+                RouteTraceResult::None
+            },
+            matched_route_index,
+            event_pattern: route.map(|route| route.event.clone()),
+            filter_keys: route
+                .map(|route| route.filter.keys().cloned().collect())
+                .unwrap_or_default(),
+            target: telemetry::safe_target_id(&target),
+        };
 
         Ok(ResolvedDelivery {
             sink,
@@ -114,6 +174,7 @@ impl Router {
                 .clone()
                 .or_else(|| route.and_then(|route| route.template.clone())),
             allow_dynamic_tokens: self.allow_dynamic_tokens_for(event, route),
+            trace,
         })
     }
 
@@ -162,9 +223,10 @@ impl Router {
             .await?;
         match delivery.target {
             SinkTarget::DiscordChannel(channel) => Ok((channel, delivery.format, content)),
-            SinkTarget::DiscordWebhook(_) | SinkTarget::SlackWebhook(_) => {
-                Err("matched route uses a webhook instead of a channel".into())
-            }
+            SinkTarget::DiscordThread(_)
+            | SinkTarget::DiscordWebhook(_)
+            | SinkTarget::SlackWebhook(_)
+            | SinkTarget::LocalFile(_) => Err("matched route uses a non-channel target".into()),
         }
     }
 
@@ -182,11 +244,6 @@ impl Router {
         }
 
         false
-    }
-
-    fn routes_for<'a>(&'a self, event: &IncomingEvent) -> Vec<&'a RouteRule> {
-        let context = event.template_context();
-        matching_routes_for(&self.config.routes, event.canonical_kind(), &context)
     }
 
     /// Produce a full provenance trace explaining how an event would be routed.
@@ -257,7 +314,7 @@ impl Router {
                 .collect();
 
         let deliveries = if ordered_matched_indices.is_empty() {
-            match self.resolve_delivery(event, None) {
+            match self.resolve_delivery(event, None, None) {
                 Ok(d) => vec![delivery_explanation(&d, None)],
                 Err(_) => vec![],
             }
@@ -266,7 +323,7 @@ impl Router {
                 .iter()
                 .filter_map(|&idx| {
                     let route = &self.config.routes[idx];
-                    self.resolve_delivery(event, Some(route))
+                    self.resolve_delivery(event, Some(route), Some(idx))
                         .ok()
                         .map(|d| delivery_explanation(&d, Some(idx)))
                 })
@@ -297,21 +354,26 @@ impl Router {
                 // For custom events (e.g. `clawhip send --channel X`), the
                 // event-level channel represents explicit user intent and must
                 // take highest priority — above both route and default channels.
-                let channel = if event.canonical_kind() == "custom" {
-                    event
-                        .channel
-                        .clone()
-                        .or_else(|| route.and_then(|route| route.channel.clone()))
-                        .or_else(|| self.config.defaults.channel.clone())
-                } else {
-                    route
-                        .and_then(|route| route.channel.clone())
-                        .or_else(|| event.channel.clone())
-                        .or_else(|| self.config.defaults.channel.clone())
+                if event.canonical_kind() == "custom"
+                    && let Some(channel) = event.channel.clone()
+                {
+                    return Ok(SinkTarget::DiscordChannel(channel));
                 }
-                .ok_or_else(|| {
-                    format!("no channel configured for event {}", event.canonical_kind())
-                })?;
+
+                if let Some(thread) = route.and_then(RouteRule::discord_thread_target) {
+                    return Ok(SinkTarget::DiscordThread(thread.to_string()));
+                }
+
+                let channel = route
+                    .and_then(|route| route.channel.clone())
+                    .or_else(|| event.channel.clone())
+                    .or_else(|| self.config.defaults.channel.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "no channel or thread configured for event {}",
+                            event.canonical_kind()
+                        )
+                    })?;
 
                 Ok(SinkTarget::DiscordChannel(channel))
             }
@@ -321,6 +383,16 @@ impl Router {
                 .ok_or_else(|| {
                     format!(
                         "no Slack webhook configured for event {}",
+                        event.canonical_kind()
+                    )
+                    .into()
+                }),
+            "localfile" => route
+                .and_then(RouteRule::local_file_target)
+                .map(|path| SinkTarget::LocalFile(path.to_string()))
+                .ok_or_else(|| {
+                    format!(
+                        "no local_path configured for event {}",
                         event.canonical_kind()
                     )
                     .into()
@@ -405,8 +477,10 @@ fn delivery_explanation(
         SinkTarget::DiscordChannel(name) => {
             (format!("DiscordChannel({name:?})"), Some(name.clone()))
         }
+        SinkTarget::DiscordThread(_) => (telemetry::safe_target_id(&delivery.target), None),
         SinkTarget::DiscordWebhook(url) => (format!("DiscordWebhook({url})"), None),
         SinkTarget::SlackWebhook(url) => (format!("SlackWebhook({url})"), None),
+        SinkTarget::LocalFile(path) => (format!("LocalFile({path})"), None),
     };
 
     DeliveryExplanation {
@@ -620,9 +694,11 @@ mod tests {
                     sink: "discord".into(),
                     filter: Default::default(),
                     channel: Some("ops".into()),
+                    thread: None,
                     channel_name: None,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: Some("@ops".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
@@ -633,9 +709,11 @@ mod tests {
                     sink: "discord".into(),
                     filter: Default::default(),
                     channel: Some("eng".into()),
+                    thread: None,
                     channel_name: None,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: Some("@eng".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Compact),
@@ -675,6 +753,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_localfile_route_targets_local_path() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "localfile".into(),
+                local_path: Some("/tmp/clawhip/events.jsonl".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event =
+            IncomingEvent::tmux_keyword("issue-226".into(), "error".into(), "boom".into(), None);
+
+        let delivery = router.preview_delivery(&event).await.unwrap();
+
+        assert_eq!(delivery.sink, "localfile");
+        assert_eq!(
+            delivery.target,
+            SinkTarget::LocalFile("/tmp/clawhip/events.jsonl".into())
+        );
+        assert_eq!(delivery.trace.result, RouteTraceResult::Matched);
+    }
+
+    #[tokio::test]
     async fn resolve_uses_defaults_when_no_routes_match() {
         let config = AppConfig {
             defaults: DefaultsConfig {
@@ -687,9 +790,11 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("github".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -709,6 +814,9 @@ mod tests {
             SinkTarget::DiscordChannel("fallback".into())
         );
         assert_eq!(deliveries[0].format, MessageFormat::Alert);
+        assert_eq!(deliveries[0].trace.result, RouteTraceResult::Fallback);
+        assert_eq!(deliveries[0].trace.matched_route_index, None);
+        assert_eq!(deliveries[0].trace.target, "discord:channel:fallback");
         assert_eq!(
             router
                 .render_delivery(&event, &deliveries[0], &DefaultRenderer)
@@ -716,6 +824,85 @@ mod tests {
                 .unwrap(),
             "🚨 wake up"
         );
+    }
+
+    #[tokio::test]
+    async fn matched_route_carries_trace_metadata() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("fallback".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "discord".into(),
+                filter: [("session".to_string(), "issue-*".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("ops".into()),
+                thread: None,
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                local_path: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event =
+            IncomingEvent::tmux_keyword("issue-214".into(), "error".into(), "boom".into(), None);
+
+        let delivery = router.preview_delivery(&event).await.unwrap();
+
+        assert_eq!(delivery.trace.result, RouteTraceResult::Matched);
+        assert_eq!(delivery.trace.matched_route_index, Some(0));
+        assert_eq!(
+            delivery.trace.event_pattern.as_deref(),
+            Some("tmux.keyword")
+        );
+        assert_eq!(delivery.trace.filter_keys, vec!["session".to_string()]);
+        assert_eq!(delivery.trace.target, "discord:channel:ops");
+    }
+
+    #[tokio::test]
+    async fn resolve_discord_route_can_target_thread() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "session.*".into(),
+                sink: "discord".into(),
+                thread: Some("thread-123".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent {
+            kind: "session.finished".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({"session_id":"sess-1"}),
+        };
+
+        let delivery = router.preview_delivery(&event).await.unwrap();
+
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordThread("thread-123".into())
+        );
+        assert!(
+            delivery
+                .trace
+                .target
+                .starts_with("discord:thread:redacted:")
+        );
+        assert!(!delivery.trace.target.contains("thread-123"));
     }
 
     #[tokio::test]
@@ -749,9 +936,11 @@ mod tests {
                     sink: "discord".into(),
                     filter: Default::default(),
                     channel: None,
+                    thread: None,
                     channel_name: None,
                     webhook: Some(failing_webhook),
                     slack_webhook: None,
+                    local_path: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -762,9 +951,11 @@ mod tests {
                     sink: "discord".into(),
                     filter: Default::default(),
                     channel: None,
+                    thread: None,
                     channel_name: None,
                     webhook: Some(successful_webhook),
                     slack_webhook: None,
+                    local_path: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -807,9 +998,11 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("route".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
@@ -845,9 +1038,11 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("worktrees".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -890,9 +1085,11 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("route".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: Some("<@1465264645320474637>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -923,9 +1120,11 @@ mod tests {
                         .into_iter()
                         .collect(),
                     channel: Some("gh-route".into()),
+                    thread: None,
                     channel_name: None,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: Some("<@botid>".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
@@ -938,9 +1137,11 @@ mod tests {
                         .into_iter()
                         .collect(),
                     channel: Some("tmux-route".into()),
+                    thread: None,
                     channel_name: None,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: Some("<@botid>".into()),
                     allow_dynamic_tokens: false,
                     format: Some(MessageFormat::Alert),
@@ -977,9 +1178,11 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("dynamic-route".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: true,
                 format: None,
@@ -1006,9 +1209,11 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("dynamic-route".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: true,
                 format: None,
@@ -1037,9 +1242,11 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("tmux-route".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
@@ -1072,9 +1279,11 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("tmux-route".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1107,9 +1316,11 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("route-channel".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1146,9 +1357,11 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("route-channel".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1193,9 +1406,11 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("agent-route".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Alert),
@@ -1257,9 +1472,11 @@ mod tests {
                 .into_iter()
                 .collect(),
                 channel: Some("session-route".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1304,9 +1521,11 @@ mod tests {
                 .into_iter()
                 .collect(),
                 channel: Some("session-route".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1363,9 +1582,11 @@ mod tests {
                 .into_iter()
                 .collect(),
                 channel: Some("agent-route".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: Some(MessageFormat::Compact),
@@ -1412,9 +1633,11 @@ mod tests {
                         .into_iter()
                         .collect(),
                     channel: Some("repo-a".into()),
+                    thread: None,
                     channel_name: None,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -1427,9 +1650,11 @@ mod tests {
                         .into_iter()
                         .collect(),
                     channel: Some("repo-b".into()),
+                    thread: None,
                     channel_name: None,
                     webhook: None,
                     slack_webhook: None,
+                    local_path: None,
                     mention: None,
                     allow_dynamic_tokens: false,
                     format: None,
@@ -1459,9 +1684,11 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("repo-name-route".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1497,9 +1724,11 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("tmux-session-name".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1526,9 +1755,11 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("session-alias-route".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1668,9 +1899,11 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: None,
+                thread: None,
                 channel_name: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1709,9 +1942,11 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: None,
+                thread: None,
                 channel_name: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1747,9 +1982,11 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("route-channel".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1785,9 +2022,11 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: None,
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: Some("<@route>".into()),
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1823,9 +2062,11 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("route-ch".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1858,9 +2099,11 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("route-ch".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1952,9 +2195,11 @@ mod tests {
                 filter: BTreeMap::from([("session".into(), "xeroclaw-*".into())]),
                 sink: "discord".into(),
                 channel: Some("xeroclaw-dev".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -1982,9 +2227,11 @@ mod tests {
                 filter: BTreeMap::from([("session_name".into(), "xeroclaw-*".into())]),
                 sink: "discord".into(),
                 channel: Some("xeroclaw-dev".into()),
+                thread: None,
                 channel_name: None,
                 webhook: None,
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -2089,9 +2336,11 @@ mod tests {
                 filter: BTreeMap::from([("session".into(), "xeroclaw-*".into())]),
                 sink: "discord".into(),
                 channel: None,
+                thread: None,
                 channel_name: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
                 slack_webhook: None,
+                local_path: None,
                 mention: None,
                 allow_dynamic_tokens: false,
                 format: None,
@@ -2368,5 +2617,37 @@ mod tests {
         assert!(parsed["routes"].is_array());
         assert!(parsed["deliveries"].is_array());
         assert_eq!(parsed["deliveries"][0]["sink"], "discord");
+    }
+
+    #[test]
+    fn explain_redacts_thread_target_in_text_and_json() {
+        let raw_thread_id = "123456789012345678";
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "session.*".into(),
+                sink: "discord".into(),
+                thread: Some(raw_thread_id.into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent {
+            kind: "session.finished".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({"session_id":"sess-1"}),
+        };
+
+        let provenance = router.explain(&event);
+        let text = provenance.to_string();
+        let serialized = serde_json::to_string(&provenance).unwrap();
+
+        for rendered in [text, serialized] {
+            assert!(rendered.contains("discord:thread:redacted:"));
+            assert!(!rendered.contains(raw_thread_id));
+        }
     }
 }
