@@ -225,6 +225,10 @@ async fn register_and_start_monitor(
     let client = DaemonClient::from_config(config);
     let registration = args.into_registration(true);
     eprintln!("{}", format_watch_audit_log(&registration));
+    persist_registration(
+        &registration,
+        registration.registration_source == RegistrationSource::CliNew,
+    )?;
     client.register_tmux(&registration).await?;
 
     let monitor_client = client.clone();
@@ -244,8 +248,21 @@ async fn register_for_daemon_monitoring(args: TmuxMonitorArgs, config: &AppConfi
     let client = DaemonClient::from_config(config);
     let registration = args.into_registration(false);
     eprintln!("{}", format_watch_audit_log(&registration));
+    persist_registration(
+        &registration,
+        registration.registration_source == RegistrationSource::CliNew,
+    )?;
     client.register_tmux(&registration).await?;
     Ok(())
+}
+
+fn persist_registration(
+    registration: &RegisteredTmuxSession,
+    spawned_by_clawhip: bool,
+) -> Result<()> {
+    crate::ledger::Ledger::open_default()?
+        .record_registration(registration, spawned_by_clawhip)
+        .map(|_| ())
 }
 
 async fn launch_session(args: &TmuxNewArgs) -> Result<()> {

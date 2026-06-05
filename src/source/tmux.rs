@@ -916,7 +916,7 @@ pub(crate) async fn session_exists(session: &str) -> Result<bool> {
     Ok(output.status.success())
 }
 
-async fn list_tmux_sessions() -> Result<HashSet<String>> {
+pub(crate) async fn list_tmux_sessions() -> Result<HashSet<String>> {
     let output = Command::new(tmux_bin())
         .arg("list-sessions")
         .arg("-F")

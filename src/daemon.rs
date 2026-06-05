@@ -31,6 +31,7 @@ use crate::native_observability::{
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 use crate::sink::{DiscordSink, LocalFileSink, Sink, SlackSink};
+use crate::source::tmux::RegistrationSource;
 use crate::source::{
     GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
     WorkspaceSource, list_active_tmux_registrations,
@@ -741,6 +742,20 @@ async fn register_tmux(
     State(state): State<AppState>,
     Json(registration): Json<RegisteredTmuxSession>,
 ) -> impl IntoResponse {
+    if let Err(error) = crate::ledger::Ledger::open_default().and_then(|ledger| {
+        ledger
+            .record_registration(
+                &registration,
+                registration.registration_source == RegistrationSource::CliNew,
+            )
+            .map(|_| ())
+    }) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": error.to_string()})),
+        )
+            .into_response();
+    }
     state
         .tmux_registry
         .write()

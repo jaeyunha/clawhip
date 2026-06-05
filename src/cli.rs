@@ -92,6 +92,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: TmuxCommands,
     },
+    /// Inspect and repair durable clawhip session lanes.
+    Lane {
+        #[command(subcommand)]
+        command: LaneCommands,
+    },
     /// Send native provider hook events to the local daemon.
     Native {
         #[command(subcommand)]
@@ -568,6 +573,46 @@ pub enum TmuxCommands {
     List,
 }
 
+#[derive(Debug, Clone, Subcommand)]
+pub enum LaneCommands {
+    /// Show durable session ledger state against live tmux and daemon watches.
+    Board(LaneBoardArgs),
+    /// Update ledger states from live tmux and daemon watch state.
+    Reconcile(LaneBoardArgs),
+    /// Mark a live infrastructure/manual session as intentionally unwatched.
+    Ignore(LaneSessionArgs),
+    /// Print the saved watch command for a session.
+    Restore(LaneRestoreArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct LaneBoardArgs {
+    /// Emit machine-readable JSON.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct LaneSessionArgs {
+    #[arg(long)]
+    pub session: String,
+    /// Emit machine-readable JSON.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct LaneRestoreArgs {
+    #[arg(long)]
+    pub session: String,
+    /// Re-register the saved watch intent with the daemon.
+    #[arg(long, default_value_t = false)]
+    pub apply: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum TmuxWrapperFormat {
     Compact,
@@ -1029,6 +1074,49 @@ mod tests {
         };
 
         assert!(matches!(command, TmuxCommands::List));
+    }
+
+    #[test]
+    fn parses_lane_board_json_subcommand() {
+        let cli = Cli::parse_from(["clawhip", "lane", "board", "--json"]);
+
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::Board(args) = command else {
+            panic!("expected lane board command");
+        };
+
+        assert!(args.json);
+    }
+
+    #[test]
+    fn parses_lane_session_subcommands() {
+        let cli = Cli::parse_from(["clawhip", "lane", "ignore", "--session", "agent-1"]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::Ignore(args) = command else {
+            panic!("expected lane ignore command");
+        };
+        assert_eq!(args.session, "agent-1");
+
+        let cli = Cli::parse_from([
+            "clawhip",
+            "lane",
+            "restore",
+            "--session",
+            "agent-1",
+            "--apply",
+        ]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::Restore(args) = command else {
+            panic!("expected lane restore command");
+        };
+        assert_eq!(args.session, "agent-1");
+        assert!(args.apply);
     }
 
     #[test]
