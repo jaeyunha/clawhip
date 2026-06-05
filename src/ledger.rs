@@ -540,6 +540,7 @@ impl SessionKind {
 #[serde(rename_all = "kebab-case")]
 pub enum SessionOwner {
     Walter,
+    HermesOrchestrator,
     Jae,
     System,
     Unknown,
@@ -549,6 +550,7 @@ impl SessionOwner {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Walter => "walter",
+            Self::HermesOrchestrator => "hermes-orchestrator",
             Self::Jae => "jae",
             Self::System => "system",
             Self::Unknown => "unknown",
@@ -558,10 +560,19 @@ impl SessionOwner {
     fn parse(value: &str) -> Result<Self> {
         match value {
             "walter" => Ok(Self::Walter),
+            "hermes-orchestrator" => Ok(Self::HermesOrchestrator),
             "jae" => Ok(Self::Jae),
             "system" => Ok(Self::System),
             "unknown" => Ok(Self::Unknown),
             _ => Err(anyhow!("invalid session owner '{value}'").into()),
+        }
+    }
+
+    fn infer_from_registration(registration: &RegisteredTmuxSession) -> Self {
+        match registration.routing.repo_name.as_deref() {
+            Some("forever-agent") => Self::Walter,
+            Some("opensend" | "forgeos") => Self::HermesOrchestrator,
+            _ => Self::Unknown,
         }
     }
 }
@@ -620,7 +631,7 @@ impl SessionInput {
             tmux_session: registration.session.clone(),
             tmux_pane: None,
             kind: SessionKind::Agent,
-            owner: SessionOwner::Walter,
+            owner: SessionOwner::infer_from_registration(registration),
             project_path: registration.routing.worktree_path.clone(),
             repo_name: registration.routing.repo_name.clone(),
             branch: registration.routing.branch.clone(),
@@ -1008,6 +1019,35 @@ mod tests {
         assert_eq!(session.repo_name.as_deref(), Some("forever-agent"));
         assert_eq!(intent.registration_source, RegistrationSource::CliNew);
         assert_eq!(intent.keywords, vec!["READY"]);
+    }
+
+    #[test]
+    fn record_registration_infers_hermes_orchestrator_owned_projects() {
+        let ledger = Ledger::open_memory().expect("ledger");
+        for repo_name in ["opensend", "forgeos"] {
+            let mut registration = registration(repo_name);
+            registration.routing.repo_name = Some(repo_name.to_string());
+
+            let (session, _) = ledger
+                .record_registration(&registration, true)
+                .expect("record");
+
+            assert_eq!(session.owner, SessionOwner::HermesOrchestrator);
+            assert_eq!(session.repo_name.as_deref(), Some(repo_name));
+        }
+    }
+
+    #[test]
+    fn record_registration_uses_unknown_owner_for_unmapped_projects() {
+        let ledger = Ledger::open_memory().expect("ledger");
+        let mut registration = registration("agent-unknown");
+        registration.routing.repo_name = Some("side-project".to_string());
+
+        let (session, _) = ledger
+            .record_registration(&registration, true)
+            .expect("record");
+
+        assert_eq!(session.owner, SessionOwner::Unknown);
     }
 
     #[test]
