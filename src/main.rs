@@ -15,6 +15,7 @@ mod gajae;
 mod gateway_allowlist;
 mod hooks;
 mod keyword_window;
+mod lane;
 mod ledger;
 mod lifecycle;
 mod memory;
@@ -391,6 +392,9 @@ async fn real_main(cli: Cli) -> Result<()> {
                 }
                 Ok(())
             }
+            LaneCommands::Inspect(args) => lane::board(args),
+            LaneCommands::Verify(args) => lane::verify(args),
+            LaneCommands::AuditWorktrees(args) => lane::audit_worktrees(args),
         },
         Commands::Native { command } => match command {
             NativeCommands::Hook(args) => {

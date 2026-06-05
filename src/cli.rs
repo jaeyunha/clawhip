@@ -92,7 +92,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: TmuxCommands,
     },
-    /// Inspect and repair durable clawhip session lanes.
+    /// Inspect, verify, and repair clawhip session lanes.
     Lane {
         #[command(subcommand)]
         command: LaneCommands,
@@ -583,6 +583,12 @@ pub enum LaneCommands {
     Ignore(LaneSessionArgs),
     /// Print the saved watch command for a session.
     Restore(LaneRestoreArgs),
+    /// Show clawhip registrations, tmux panes, and worktree hygiene in one inspector.
+    Inspect(LaneInspectArgs),
+    /// Capture pane, git, and PR evidence for one tmux-backed lane.
+    Verify(LaneVerifyArgs),
+    /// Classify git worktrees under a directory for cleanup/salvage.
+    AuditWorktrees(LaneWorktreesArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -608,6 +614,37 @@ pub struct LaneRestoreArgs {
     /// Re-register the saved watch intent with the daemon.
     #[arg(long, default_value_t = false)]
     pub apply: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct LaneInspectArgs {
+    /// Worktree root to audit. Repeatable. Defaults to ~/wt/opensend when present.
+    #[arg(long = "worktree-root")]
+    pub worktree_root: Vec<PathBuf>,
+    /// Maximum worktree directories to inspect per root.
+    #[arg(long, default_value_t = 120)]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct LaneVerifyArgs {
+    /// Tmux session name to verify.
+    pub session: String,
+    /// Number of pane-tail lines to capture.
+    #[arg(long, default_value_t = 160)]
+    pub lines: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct LaneWorktreesArgs {
+    /// Directory containing git worktrees to classify.
+    pub path: PathBuf,
+    /// Maximum worktree directories to inspect.
+    #[arg(long, default_value_t = 200)]
+    pub limit: usize,
     /// Emit machine-readable JSON.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -1117,6 +1154,53 @@ mod tests {
         };
         assert_eq!(args.session, "agent-1");
         assert!(args.apply);
+    }
+
+    #[test]
+    fn parses_lane_inspect_subcommand() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "lane",
+            "inspect",
+            "--worktree-root",
+            "/tmp/wt",
+            "--limit",
+            "7",
+        ]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::Inspect(args) = command else {
+            panic!("expected lane inspect");
+        };
+        assert_eq!(args.worktree_root, vec![PathBuf::from("/tmp/wt")]);
+        assert_eq!(args.limit, 7);
+    }
+
+    #[test]
+    fn parses_lane_verify_subcommand() {
+        let cli = Cli::parse_from(["clawhip", "lane", "verify", "opensend-123", "--lines", "42"]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::Verify(args) = command else {
+            panic!("expected lane verify");
+        };
+        assert_eq!(args.session, "opensend-123");
+        assert_eq!(args.lines, 42);
+    }
+
+    #[test]
+    fn parses_lane_audit_worktrees_subcommand() {
+        let cli = Cli::parse_from(["clawhip", "lane", "audit-worktrees", "/tmp/wt", "--json"]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::AuditWorktrees(args) = command else {
+            panic!("expected lane audit-worktrees");
+        };
+        assert_eq!(args.path, PathBuf::from("/tmp/wt"));
+        assert!(args.json);
     }
 
     #[test]
