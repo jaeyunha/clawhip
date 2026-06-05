@@ -638,6 +638,7 @@ Behavior:
 - `lane restore --apply` re-registers a saved watch intent after daemon monitoring is lost
 - `lane ignore` is for live manual/dev-server tmux sessions; it refuses clawhip-managed agent lanes
 - `lane inspect` is an ad hoc tmux/worktree inspector and does not replace the durable `lane board`
+- forever-agent dev servers launched by `bun run dev:all` use `ever-<worktree-basename>` tmux sessions; these appear as `infra-candidate` until ignored, and can be attached with `tmux attach -t ever-<worktree-basename>`
 - final delivery still goes through daemon routing
 - `deliver` refuses arbitrary shells and requires prompt-submit-aware hook setup (`clawhip hooks install --provider codex --scope global|project` for Codex, with the bridge in `~/.clawhip`, or `clawhip hooks install --provider claude-code --scope global` for Claude Code)
 

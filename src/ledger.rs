@@ -334,6 +334,7 @@ pub enum LaneStatus {
     LostMonitoring,
     IgnoredInfra,
     UnknownTmux,
+    InfraCandidate,
     ExternallyWatched,
     DeadSession,
 }
@@ -345,6 +346,7 @@ impl LaneStatus {
             Self::LostMonitoring => "lost-monitoring",
             Self::IgnoredInfra => "ignored-infra",
             Self::UnknownTmux => "unknown-tmux",
+            Self::InfraCandidate => "infra-candidate",
             Self::ExternallyWatched => "externally-watched",
             Self::DeadSession => "dead-session",
         }
@@ -452,7 +454,7 @@ pub fn classify_lanes(
         }
         rows.push(LaneRow {
             session: session.clone(),
-            status: LaneStatus::UnknownTmux,
+            status: classify_unclaimed_tmux_session(session),
             kind: SessionKind::Unknown,
             owner: SessionOwner::Unknown,
             state: SessionState::Unknown,
@@ -494,6 +496,14 @@ fn classify_ledger_session(
         return LaneStatus::ExternallyWatched;
     }
     LaneStatus::UnknownTmux
+}
+
+fn classify_unclaimed_tmux_session(session: &str) -> LaneStatus {
+    if session.starts_with("ever-") {
+        LaneStatus::InfraCandidate
+    } else {
+        LaneStatus::UnknownTmux
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1035,10 +1045,17 @@ mod tests {
         let mut external_registration = registration("external");
         external_registration.registration_source = RegistrationSource::CliWatch;
         let daemon_registrations = vec![registration("healthy"), external_registration];
-        let live_tmux_sessions = ["external", "healthy", "infra", "lost", "manual"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let live_tmux_sessions = [
+            "ever-forever-agent",
+            "external",
+            "healthy",
+            "infra",
+            "lost",
+            "manual",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
 
         let rows = classify_lanes(
             &ledger.sessions().unwrap(),
@@ -1055,6 +1072,7 @@ mod tests {
         assert_eq!(statuses["lost"], LaneStatus::LostMonitoring);
         assert_eq!(statuses["infra"], LaneStatus::IgnoredInfra);
         assert_eq!(statuses["manual"], LaneStatus::UnknownTmux);
+        assert_eq!(statuses["ever-forever-agent"], LaneStatus::InfraCandidate);
         assert_eq!(statuses["external"], LaneStatus::ExternallyWatched);
         assert_eq!(statuses["dead"], LaneStatus::DeadSession);
     }

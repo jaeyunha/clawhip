@@ -294,7 +294,10 @@ async fn real_main(cli: Cli) -> Result<()> {
                 let rows = load_lane_rows(config.as_ref(), LaneSnapshotMode::Strict).await?;
                 for row in &rows {
                     if ledger.session_by_name(&row.session)?.is_none() {
-                        if row.status == ledger::LaneStatus::UnknownTmux {
+                        if matches!(
+                            row.status,
+                            ledger::LaneStatus::UnknownTmux | ledger::LaneStatus::InfraCandidate
+                        ) {
                             ledger.upsert_session(manual_session_input(
                                 &row.session,
                                 ledger::SessionState::Unknown,
@@ -309,7 +312,9 @@ async fn real_main(cli: Cli) -> Result<()> {
                         ledger::LaneStatus::LostMonitoring => ledger::SessionState::LostMonitoring,
                         ledger::LaneStatus::IgnoredInfra => ledger::SessionState::IgnoredAlive,
                         ledger::LaneStatus::DeadSession => ledger::SessionState::Dead,
-                        ledger::LaneStatus::UnknownTmux => ledger::SessionState::Unknown,
+                        ledger::LaneStatus::UnknownTmux | ledger::LaneStatus::InfraCandidate => {
+                            ledger::SessionState::Unknown
+                        }
                     };
                     ledger.set_session_state(&row.session, state)?;
                 }
