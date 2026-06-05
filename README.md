@@ -617,12 +617,27 @@ clawhip deliver \
   --max-enters 4
 ```
 
+Durable lane recovery:
+```bash
+clawhip lane board
+clawhip lane reconcile
+clawhip lane restore --session <session>
+clawhip lane restore --session <session> --apply
+clawhip lane ignore --session <manual-dev-server-session>
+clawhip lane inspect
+```
+
 Behavior:
 - Codex and Claude should own session launch and hook registration
 - `clawhip native hook` is the local thin-client ingress for provider payloads
 - `tmux new` / `tmux watch` are fallback paths for debugging or manual recovery
 - `deliver` is the prompt recovery path for an already-running hooked tmux-backed provider session
 - `tmux list` shows active daemon-known watches with source, registration timestamp, and parent-process info
+- `lane board` shows durable ledger state against live tmux and daemon watches; `SPAWNED=yes` / `SOURCE=cli-new` means clawhip spawned the lane
+- `lane reconcile` is strict and mutates ledger state only when tmux and daemon inventory are both available
+- `lane restore --apply` re-registers a saved watch intent after daemon monitoring is lost
+- `lane ignore` is for live manual/dev-server tmux sessions; it refuses clawhip-managed agent lanes
+- `lane inspect` is an ad hoc tmux/worktree inspector and does not replace the durable `lane board`
 - final delivery still goes through daemon routing
 - `deliver` refuses arbitrary shells and requires prompt-submit-aware hook setup (`clawhip hooks install --provider codex --scope global|project` for Codex, with the bridge in `~/.clawhip`, or `clawhip hooks install --provider claude-code --scope global` for Claude Code)
 
