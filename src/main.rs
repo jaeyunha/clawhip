@@ -26,6 +26,7 @@ mod provenance;
 mod release_preflight;
 mod render;
 mod router;
+mod shell;
 mod sink;
 mod slack;
 mod source;
@@ -469,7 +470,7 @@ async fn real_main(cli: Cli) -> Result<()> {
                     let registration = registration_from_lane_restore(&session, &intent);
                     let client = DaemonClient::from_config(config.as_ref());
                     client.register_tmux(&registration).await?;
-                    ledger.record_registration(&registration, session.spawned_by_clawhip)?;
+                    ledger.record_registration(&registration, session.spawned_by_clawhip, &[])?;
                 }
                 if args.json {
                     println!(
@@ -487,9 +488,9 @@ async fn real_main(cli: Cli) -> Result<()> {
                 }
                 Ok(())
             }
-            LaneCommands::Inspect(args) => lane::board(args),
-            LaneCommands::Verify(args) => lane::verify(args),
-            LaneCommands::AuditWorktrees(args) => lane::audit_worktrees(args),
+            LaneCommands::Inspect(args) => lane::board(args, config.as_ref()).await,
+            LaneCommands::Verify(args) => lane::verify(args).await,
+            LaneCommands::AuditWorktrees(args) => lane::audit_worktrees(args).await,
         },
         Commands::Native { command } => match command {
             NativeCommands::Hook(args) => {
@@ -827,6 +828,7 @@ async fn load_lane_rows(
         &intents,
         &registrations,
         &live_tmux_sessions,
+        &config.monitors.infra_session_prefixes,
     ))
 }
 
@@ -909,7 +911,7 @@ fn registration_from_lane_restore(
             ..RoutingMetadata::default()
         },
         keywords: intent.keywords.clone(),
-        keyword_window_secs: 30,
+        keyword_window_secs: crate::shell::DEFAULT_KEYWORD_WINDOW_SECS,
         stale_minutes: intent.stale_minutes,
         format: intent.format.clone(),
         registered_at: crate::source::tmux::current_timestamp_rfc3339(),
@@ -1073,7 +1075,7 @@ mod tests {
             mention: Some("<@123>".into()),
             routing: RoutingMetadata::default(),
             keywords: vec!["error".into(), "complete".into()],
-            keyword_window_secs: 30,
+            keyword_window_secs: crate::shell::DEFAULT_KEYWORD_WINDOW_SECS,
             stale_minutes: 10,
             format: None,
             registered_at: "2026-04-02T00:00:00Z".into(),
@@ -1106,7 +1108,7 @@ mod tests {
             workflow_status: WorkflowStatus::Active,
             runtime_status: RuntimeStatus::Live,
             kind: SessionKind::Agent,
-            owner: SessionOwner::Walter,
+            owner: SessionOwner::Named("walter".to_string()),
             state: SessionState::LostMonitoring,
             spawned_by_clawhip: true,
             expected_watch: true,

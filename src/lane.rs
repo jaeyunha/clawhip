@@ -3,27 +3,37 @@ use std::process::Command;
 
 use crate::Result;
 use crate::cli::{LaneInspectArgs, LaneVerifyArgs, LaneWorktreesArgs};
+use crate::config::AppConfig;
+use crate::source::tmux::tmux_bin;
 
-pub fn board(args: LaneInspectArgs) -> Result<()> {
+// Task C: reuse async source/tmux helpers for session listing.
+// Task A: board takes config for lane_worktree_roots.
+// Task E: timeout_secs removed from run(); run_shell and args_with_program deleted.
+
+pub async fn board(args: LaneInspectArgs, config: &AppConfig) -> Result<()> {
     print_clawhip_tmux()?;
     println!();
-    print_tmux_panes()?;
+    print_tmux_panes().await?;
 
-    let roots = if args.worktree_root.is_empty() {
-        let default = home_dir().join("wt/opensend");
-        if default.exists() {
-            vec![default]
-        } else {
-            Vec::new()
-        }
-    } else {
+    // Task A: --worktree-root flags win; fall back to config roots;
+    // if neither is present, print a note and skip.
+    let roots: Vec<PathBuf> = if !args.worktree_root.is_empty() {
         args.worktree_root
+    } else if !config.monitors.lane_worktree_roots.is_empty() {
+        config
+            .monitors
+            .lane_worktree_roots
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+    } else {
+        println!(
+            "(worktree audit skipped: no --worktree-root flag and no lane_worktree_roots configured)"
+        );
+        Vec::new()
     };
 
-    let active_paths = tmux_panes(None)?
-        .into_iter()
-        .filter_map(|pane| pane.cwd)
-        .collect::<Vec<_>>();
+    let active_paths = tmux_pane_cwds().await?;
 
     for root in roots {
         println!();
@@ -33,8 +43,8 @@ pub fn board(args: LaneInspectArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn verify(args: LaneVerifyArgs) -> Result<()> {
-    let panes = tmux_panes(Some(&args.session))?;
+pub async fn verify(args: LaneVerifyArgs) -> Result<()> {
+    let panes = tmux_panes_for_session(&args.session).await?;
     println!("== verify session: {} ==", args.session);
     if panes.is_empty() {
         println!("tmux session/pane not found");
@@ -73,17 +83,14 @@ pub fn verify(args: LaneVerifyArgs) -> Result<()> {
             println!("git: not inside worktree");
         }
         println!("\n[pane tail -{}]", args.lines);
-        println!("{}", capture_pane(&args.session, args.lines)?);
+        println!("{}", capture_pane_content(&args.session, args.lines)?);
     }
 
     Ok(())
 }
 
-pub fn audit_worktrees(args: LaneWorktreesArgs) -> Result<()> {
-    let active_paths = tmux_panes(None)?
-        .into_iter()
-        .filter_map(|pane| pane.cwd)
-        .collect::<Vec<_>>();
+pub async fn audit_worktrees(args: LaneWorktreesArgs) -> Result<()> {
+    let active_paths = tmux_pane_cwds().await?;
     let rows = collect_worktree_rows(&args.path, &active_paths, args.limit)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -95,7 +102,10 @@ pub fn audit_worktrees(args: LaneWorktreesArgs) -> Result<()> {
 
 fn print_clawhip_tmux() -> Result<()> {
     println!("== clawhip tmux ==");
-    let output = run_shell("clawhip tmux list 2>/dev/null || true", None, 10)?;
+    let output = run(
+        &["bash", "-lc", "clawhip tmux list 2>/dev/null || true"],
+        None,
+    )?;
     println!(
         "{}",
         empty_as(output.stdout.trim(), "No clawhip tmux output")
@@ -103,9 +113,9 @@ fn print_clawhip_tmux() -> Result<()> {
     Ok(())
 }
 
-fn print_tmux_panes() -> Result<()> {
+async fn print_tmux_panes() -> Result<()> {
     println!("== tmux panes ==");
-    let panes = tmux_panes(None)?;
+    let panes = tmux_panes_all().await?;
     let mut rows = Vec::new();
     for pane in panes {
         let cwd = pane.cwd.unwrap_or_default();
@@ -267,14 +277,12 @@ fn git_status(path: &Path) -> GitStatus {
             "--branch",
         ],
         None,
-        10,
     )
     .unwrap_or_default()
     .stdout;
     let diff_stat = run(
         &["git", "-C", &path.display().to_string(), "diff", "--stat"],
         None,
-        10,
     )
     .unwrap_or_default()
     .stdout;
@@ -287,7 +295,6 @@ fn git_status(path: &Path) -> GitStatus {
             "--show-toplevel",
         ],
         None,
-        5,
     )
     .ok()
     .filter(|out| out.status.success())
@@ -330,14 +337,14 @@ fn is_git_worktree(path: &Path) -> bool {
             "--is-inside-work-tree",
         ],
         None,
-        5,
     )
     .ok()
     .is_some_and(|out| out.status.success() && out.stdout.trim() == "true")
 }
 
+// Task C: pane data type used only within lane.rs; populated from tmux CLI.
 #[derive(Debug, Default)]
-struct TmuxPane {
+struct TmuxPaneInfo {
     session: String,
     pane: String,
     pid: Option<String>,
@@ -346,32 +353,51 @@ struct TmuxPane {
     dead: bool,
 }
 
-fn tmux_panes(session: Option<&str>) -> Result<Vec<TmuxPane>> {
-    let mut args = vec!["list-panes"];
-    let target;
-    if let Some(session) = session {
-        target = vec!["-t", session];
-        args.extend(target.iter().copied());
+/// Collect pane info for all sessions (replaces the old sync `tmux_panes(None)`).
+async fn tmux_panes_all() -> Result<Vec<TmuxPaneInfo>> {
+    tmux_panes_raw(None).await
+}
+
+/// Collect pane info for a specific session (replaces `tmux_panes(Some(session))`).
+async fn tmux_panes_for_session(session: &str) -> Result<Vec<TmuxPaneInfo>> {
+    tmux_panes_raw(Some(session)).await
+}
+
+/// Collect CWDs from all tmux panes (used for worktree audit).
+async fn tmux_pane_cwds() -> Result<Vec<PathBuf>> {
+    Ok(tmux_panes_all()
+        .await?
+        .into_iter()
+        .filter_map(|pane| pane.cwd)
+        .collect())
+}
+
+async fn tmux_panes_raw(session: Option<&str>) -> Result<Vec<TmuxPaneInfo>> {
+    let tmux = tmux_bin();
+    let mut cmd = tokio::process::Command::new(&tmux);
+    cmd.arg("list-panes");
+    if let Some(s) = session {
+        cmd.arg("-t").arg(s);
     } else {
-        args.push("-a");
+        cmd.arg("-a");
     }
-    args.extend([
-        "-F",
+    cmd.arg("-F").arg(
         "#{session_name}\t#{window_index}.#{pane_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_active}\t#{pane_dead}",
-    ]);
-    let output = run(&args_with_program("tmux", &args), None, 10)?;
+    );
+
+    let output = cmd.output().await?;
     if !output.status.success() {
         return Ok(Vec::new());
     }
-    let panes = output
-        .stdout
+
+    let panes = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
             let parts = line.split('\t').collect::<Vec<_>>();
             if parts.len() < 7 {
                 return None;
             }
-            Some(TmuxPane {
+            Some(TmuxPaneInfo {
                 session: parts[0].to_string(),
                 pane: parts[1].to_string(),
                 pid: Some(parts[2].to_string()).filter(|s| !s.is_empty()),
@@ -384,12 +410,11 @@ fn tmux_panes(session: Option<&str>) -> Result<Vec<TmuxPane>> {
     Ok(panes)
 }
 
-fn capture_pane(session: &str, lines: usize) -> Result<String> {
+fn capture_pane_content(session: &str, lines: usize) -> Result<String> {
     let start = format!("-{lines}");
     let output = run(
         &["tmux", "capture-pane", "-pt", session, "-S", &start],
         None,
-        10,
     )?;
     Ok(if output.status.success() {
         output.stdout
@@ -408,7 +433,6 @@ fn gh_pr_for_branch(path: &Path) -> String {
             "--show-current",
         ],
         None,
-        5,
     )
     .ok()
     .filter(|out| out.status.success())
@@ -429,7 +453,6 @@ fn gh_pr_for_branch(path: &Path) -> String {
             ".",
         ],
         Some(path),
-        20,
     )
     .ok()
     .filter(|out| out.status.success())
@@ -444,7 +467,8 @@ struct CmdOutput {
     stderr: String,
 }
 
-fn run(args: &[&str], cwd: Option<&Path>, timeout_secs: u64) -> Result<CmdOutput> {
+// Task E: timeout_secs parameter removed.
+fn run(args: &[&str], cwd: Option<&Path>) -> Result<CmdOutput> {
     let mut command = Command::new(args[0]);
     command.args(&args[1..]);
     if let Some(cwd) = cwd {
@@ -453,24 +477,11 @@ fn run(args: &[&str], cwd: Option<&Path>, timeout_secs: u64) -> Result<CmdOutput
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
     let output = command.output()?;
-    let _ = timeout_secs; // Keep signature parallel to prototype; Rust MVP does not enforce timeout yet.
     Ok(CmdOutput {
         status: output.status,
         stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
     })
-}
-
-fn run_shell(cmd: &str, cwd: Option<&Path>, timeout_secs: u64) -> Result<CmdOutput> {
-    let _ = timeout_secs;
-    run(&["bash", "-lc", cmd], cwd, timeout_secs)
-}
-
-fn args_with_program<'a>(program: &'a str, args: &'a [&'a str]) -> Vec<&'a str> {
-    let mut all = Vec::with_capacity(args.len() + 1);
-    all.push(program);
-    all.extend_from_slice(args);
-    all
 }
 
 fn print_table(headers: &[&str], rows: &[Vec<String>]) {
@@ -526,10 +537,4 @@ fn empty_as<'a>(value: &'a str, fallback: &'a str) -> &'a str {
 
 fn truncate_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
 }

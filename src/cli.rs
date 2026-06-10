@@ -669,7 +669,7 @@ pub struct LaneRestoreArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct LaneInspectArgs {
-    /// Worktree root to audit. Repeatable. Defaults to ~/wt/opensend when present.
+    /// Worktree root to audit. Repeatable. Falls back to lane_worktree_roots in config when omitted.
     #[arg(long = "worktree-root")]
     pub worktree_root: Vec<PathBuf>,
     /// Maximum worktree directories to inspect per root.

@@ -266,10 +266,12 @@ impl Ledger {
         &self,
         registration: &RegisteredTmuxSession,
         spawned_by_clawhip: bool,
+        owner_mappings: &[crate::config::SessionOwnerMapping],
     ) -> Result<(SessionRecord, WatchIntentRecord)> {
         let session = self.upsert_session(SessionInput::from_registration(
             registration,
             spawned_by_clawhip,
+            owner_mappings,
         ))?;
         let intent = self.upsert_watch_intent(WatchIntentInput::from_registration(registration))?;
         Ok((session, intent))
@@ -542,6 +544,7 @@ pub fn classify_lanes(
     watch_intents: &[WatchIntentRecord],
     daemon_registrations: &[RegisteredTmuxSession],
     live_tmux_sessions: &BTreeSet<String>,
+    infra_session_prefixes: &[String],
 ) -> Vec<LaneRow> {
     let intent_by_session = watch_intents
         .iter()
@@ -575,7 +578,7 @@ pub fn classify_lanes(
             workflow_status: session.workflow_status,
             runtime_status: RuntimeStatus::from_live_tmux(live_tmux),
             kind: session.kind,
-            owner: session.owner,
+            owner: session.owner.clone(),
             state: session.state,
             spawned_by_clawhip: session.spawned_by_clawhip,
             expected_watch: session.expected_watch,
@@ -632,7 +635,7 @@ pub fn classify_lanes(
         }
         rows.push(LaneRow {
             session: session.clone(),
-            status: classify_unclaimed_tmux_session(session),
+            status: classify_unclaimed_tmux_session(session, infra_session_prefixes),
             workflow_status: WorkflowStatus::Active,
             runtime_status: RuntimeStatus::Live,
             kind: SessionKind::Unknown,
@@ -679,8 +682,11 @@ fn classify_ledger_session(
     LaneStatus::UnknownTmux
 }
 
-fn classify_unclaimed_tmux_session(session: &str) -> LaneStatus {
-    if session.starts_with("ever-") {
+fn classify_unclaimed_tmux_session(session: &str, infra_prefixes: &[String]) -> LaneStatus {
+    if infra_prefixes
+        .iter()
+        .any(|prefix| session.starts_with(prefix.as_str()))
+    {
         LaneStatus::InfraCandidate
     } else {
         LaneStatus::UnknownTmux
@@ -717,44 +723,46 @@ impl SessionKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum SessionOwner {
-    Walter,
-    HermesOrchestrator,
-    Jae,
     System,
     Unknown,
+    Named(String),
 }
 
 impl SessionOwner {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
-            Self::Walter => "walter",
-            Self::HermesOrchestrator => "hermes-orchestrator",
-            Self::Jae => "jae",
             Self::System => "system",
             Self::Unknown => "unknown",
+            Self::Named(name) => name.as_str(),
         }
     }
 
     fn parse(value: &str) -> Result<Self> {
         match value {
-            "walter" => Ok(Self::Walter),
-            "hermes-orchestrator" => Ok(Self::HermesOrchestrator),
-            "jae" => Ok(Self::Jae),
             "system" => Ok(Self::System),
             "unknown" => Ok(Self::Unknown),
-            _ => Err(anyhow!("invalid session owner '{value}'").into()),
+            "" => Err(anyhow!("session owner cannot be empty").into()),
+            other => Ok(Self::Named(other.to_string())),
         }
     }
 
-    fn infer_from_registration(registration: &RegisteredTmuxSession) -> Self {
-        match registration.routing.repo_name.as_deref() {
-            Some("forever-agent") => Self::Walter,
-            Some("opensend" | "forgeos") => Self::HermesOrchestrator,
-            _ => Self::Unknown,
+    fn infer_from_registration(
+        registration: &RegisteredTmuxSession,
+        mappings: &[crate::config::SessionOwnerMapping],
+    ) -> Self {
+        let repo = match registration.routing.repo_name.as_deref() {
+            Some(r) => r,
+            None => return Self::Unknown,
+        };
+        for mapping in mappings {
+            if mapping.repo == repo {
+                return Self::Named(mapping.owner.clone());
+            }
         }
+        Self::Unknown
     }
 }
 
@@ -811,12 +819,16 @@ pub struct SessionInput {
 }
 
 impl SessionInput {
-    fn from_registration(registration: &RegisteredTmuxSession, spawned_by_clawhip: bool) -> Self {
+    fn from_registration(
+        registration: &RegisteredTmuxSession,
+        spawned_by_clawhip: bool,
+        owner_mappings: &[crate::config::SessionOwnerMapping],
+    ) -> Self {
         Self {
             tmux_session: registration.session.clone(),
             tmux_pane: None,
             kind: SessionKind::Agent,
-            owner: SessionOwner::infer_from_registration(registration),
+            owner: SessionOwner::infer_from_registration(registration, owner_mappings),
             project_path: registration.routing.worktree_path.clone(),
             repo_name: registration.routing.repo_name.clone(),
             branch: registration.routing.branch.clone(),
@@ -1043,14 +1055,7 @@ fn to_sql_dyn_error(error: crate::DynError) -> rusqlite::Error {
 }
 
 fn shell_quote(arg: &str) -> String {
-    if arg
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.' | ':' | '@'))
-    {
-        arg.to_string()
-    } else {
-        format!("'{}'", arg.replace('\'', "'\\''"))
-    }
+    crate::shell::shell_quote(arg)
 }
 
 #[cfg(test)]
@@ -1063,7 +1068,7 @@ mod tests {
             tmux_session: name.to_string(),
             tmux_pane: Some("0.0".to_string()),
             kind: SessionKind::Agent,
-            owner: SessionOwner::Walter,
+            owner: SessionOwner::Named("alice".to_string()),
             project_path: Some("/tmp/project".to_string()),
             repo_name: Some("project".to_string()),
             branch: Some("main".to_string()),
@@ -1179,6 +1184,13 @@ mod tests {
         );
     }
 
+    fn owner_mapping(repo: &str, owner: &str) -> crate::config::SessionOwnerMapping {
+        crate::config::SessionOwnerMapping {
+            repo: repo.to_string(),
+            owner: owner.to_string(),
+        }
+    }
+
     #[test]
     fn record_registration_captures_routing_metadata() {
         let ledger = Ledger::open_memory().expect("ledger");
@@ -1202,12 +1214,13 @@ mod tests {
             parent_process: None,
             active_wrapper_monitor: false,
         };
+        let mappings = vec![owner_mapping("forever-agent", "walter")];
 
         let (session, intent) = ledger
-            .record_registration(&registration, true)
+            .record_registration(&registration, true, &mappings)
             .expect("record");
         assert_eq!(session.kind, SessionKind::Agent);
-        assert_eq!(session.owner, SessionOwner::Walter);
+        assert_eq!(session.owner, SessionOwner::Named("walter".to_string()));
         assert!(session.spawned_by_clawhip);
         assert!(session.expected_watch);
         assert_eq!(session.repo_name.as_deref(), Some("forever-agent"));
@@ -1220,7 +1233,7 @@ mod tests {
         let ledger = Ledger::open_memory().expect("ledger");
         let initial_registration = registration("agent-reregistered");
         let (session, _) = ledger
-            .record_registration(&initial_registration, true)
+            .record_registration(&initial_registration, true, &[])
             .expect("record initial clawhip spawn");
 
         assert!(session.spawned_by_clawhip);
@@ -1232,7 +1245,7 @@ mod tests {
         watch_registration.thread = Some("thread-123".to_string());
 
         let (session, intent) = ledger
-            .record_registration(&watch_registration, false)
+            .record_registration(&watch_registration, false, &[])
             .expect("record reregistration");
 
         assert!(session.spawned_by_clawhip);
@@ -1245,19 +1258,50 @@ mod tests {
     }
 
     #[test]
-    fn record_registration_infers_hermes_orchestrator_owned_projects() {
+    fn record_registration_config_driven_owner_mapping() {
         let ledger = Ledger::open_memory().expect("ledger");
+        let mappings = vec![
+            owner_mapping("opensend", "hermes"),
+            owner_mapping("forgeos", "hermes"),
+        ];
         for repo_name in ["opensend", "forgeos"] {
-            let mut registration = registration(repo_name);
-            registration.routing.repo_name = Some(repo_name.to_string());
+            let mut reg = registration(repo_name);
+            reg.routing.repo_name = Some(repo_name.to_string());
 
             let (session, _) = ledger
-                .record_registration(&registration, true)
+                .record_registration(&reg, true, &mappings)
                 .expect("record");
 
-            assert_eq!(session.owner, SessionOwner::HermesOrchestrator);
+            assert_eq!(
+                session.owner,
+                SessionOwner::Named("hermes".to_string()),
+                "repo {repo_name}"
+            );
             assert_eq!(session.repo_name.as_deref(), Some(repo_name));
         }
+    }
+
+    #[test]
+    fn old_db_owner_values_parse_as_named() {
+        // Old DB rows like owner="walter" or owner="hermes-orchestrator" must
+        // round-trip through parse() as Named(...), not error.
+        let walter = SessionOwner::parse("walter").expect("parse walter");
+        assert_eq!(walter, SessionOwner::Named("walter".to_string()));
+        assert_eq!(walter.as_str(), "walter");
+
+        let hermes = SessionOwner::parse("hermes-orchestrator").expect("parse hermes");
+        assert_eq!(
+            hermes,
+            SessionOwner::Named("hermes-orchestrator".to_string())
+        );
+
+        let system = SessionOwner::parse("system").expect("parse system");
+        assert_eq!(system, SessionOwner::System);
+
+        let unknown = SessionOwner::parse("unknown").expect("parse unknown");
+        assert_eq!(unknown, SessionOwner::Unknown);
+
+        assert!(SessionOwner::parse("").is_err());
     }
 
     #[test]
@@ -1267,7 +1311,7 @@ mod tests {
         registration.routing.repo_name = Some("side-project".to_string());
 
         let (session, _) = ledger
-            .record_registration(&registration, true)
+            .record_registration(&registration, true, &[])
             .expect("record");
 
         assert_eq!(session.owner, SessionOwner::Unknown);
@@ -1320,11 +1364,13 @@ mod tests {
         .map(str::to_string)
         .collect();
 
+        let infra_prefixes = vec!["ever-".to_string()];
         let rows = classify_lanes(
             &ledger.sessions().unwrap(),
             &ledger.watch_intents().unwrap(),
             &daemon_registrations,
             &live_tmux_sessions,
+            &infra_prefixes,
         );
         let statuses = rows
             .iter()
@@ -1362,6 +1408,7 @@ mod tests {
             &ledger.watch_intents().unwrap(),
             &[],
             &BTreeSet::new(),
+            &[],
         );
 
         assert!(rows.is_empty());
@@ -1380,6 +1427,7 @@ mod tests {
             &ledger.watch_intents().unwrap(),
             &[],
             &BTreeSet::new(),
+            &[],
         );
 
         assert_eq!(rows[0].status, LaneStatus::TmuxMissing);
@@ -1393,7 +1441,7 @@ mod tests {
         registration.thread = Some("thread-123".to_string());
 
         let (_session, intent) = ledger
-            .record_registration(&registration, true)
+            .record_registration(&registration, true, &[])
             .expect("registration");
 
         assert_eq!(intent.channel, None);

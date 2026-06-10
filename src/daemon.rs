@@ -673,7 +673,7 @@ async fn enrich_correlated_lane_target(state: &AppState, event: &mut IncomingEve
     let Some(registration) = find_correlated_tmux_registration(&registry, event) else {
         return;
     };
-    let Some(thread) = registration.thread.as_ref().map(String::as_str) else {
+    let Some(thread) = registration.thread.as_deref() else {
         return;
     };
 
@@ -812,6 +812,7 @@ async fn register_tmux(
             .record_registration(
                 &registration,
                 registration.registration_source == RegistrationSource::CliNew,
+                &state.config.monitors.session_owners,
             )
             .map(|_| ())
     }) {

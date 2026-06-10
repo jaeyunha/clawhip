@@ -72,7 +72,7 @@ impl From<&TmuxNewArgs> for TmuxMonitorArgs {
             mention: value.mention.clone(),
             routing: routing_metadata_for_cwd(value.cwd.as_deref()),
             keywords: value.keywords.clone(),
-            keyword_window_secs: default_keyword_window_secs(),
+            keyword_window_secs: crate::shell::DEFAULT_KEYWORD_WINDOW_SECS,
             stale_minutes: value.stale_minutes,
             format: value.format,
             registered_at: current_timestamp_rfc3339(),
@@ -105,7 +105,7 @@ impl From<&TmuxWatchArgs> for TmuxMonitorArgs {
             mention: value.mention.clone(),
             routing: routing_metadata_for_session(&value.session),
             keywords: value.keywords.clone(),
-            keyword_window_secs: default_keyword_window_secs(),
+            keyword_window_secs: crate::shell::DEFAULT_KEYWORD_WINDOW_SECS,
             stale_minutes: value.stale_minutes,
             format: value.format,
             registered_at: current_timestamp_rfc3339(),
@@ -276,7 +276,7 @@ fn persist_registration(
     spawned_by_clawhip: bool,
 ) -> Result<()> {
     crate::ledger::Ledger::open_default()?
-        .record_registration(registration, spawned_by_clawhip)
+        .record_registration(registration, spawned_by_clawhip, &[])
         .map(|_| ())
 }
 
@@ -415,7 +415,11 @@ fn build_command_to_send(args: &TmuxNewArgs) -> Option<String> {
         shell_join(&args.command)
     };
     Some(match &args.shell {
-        Some(shell) => format!("{} -c {}", shell_escape(shell), shell_escape(&joined)),
+        Some(shell) => format!(
+            "{} -c {}",
+            crate::shell::shell_quote(shell),
+            crate::shell::shell_quote(&joined)
+        ),
         None => joined,
     })
 }
@@ -423,21 +427,9 @@ fn build_command_to_send(args: &TmuxNewArgs) -> Option<String> {
 fn shell_join(parts: &[String]) -> String {
     parts
         .iter()
-        .map(|part| shell_escape(part))
+        .map(|part| crate::shell::shell_quote(part))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn shell_escape(value: &str) -> String {
-    if !value.is_empty()
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || "_@%+=:,./-".contains(ch))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
 }
 
 fn tmux_stderr(stderr: &[u8]) -> String {
@@ -456,10 +448,6 @@ async fn attach_session(session: &str) -> Result<()> {
     } else {
         Err(tmux_stderr(&output.stderr).into())
     }
-}
-
-fn default_keyword_window_secs() -> u64 {
-    30
 }
 
 fn current_parent_process_info() -> Option<ParentProcessInfo> {

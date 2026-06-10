@@ -59,7 +59,7 @@ pub struct RegisteredTmuxSession {
     pub routing: RoutingMetadata,
     #[serde(default)]
     pub keywords: Vec<String>,
-    #[serde(default = "default_keyword_window_secs")]
+    #[serde(default = "crate::shell::default_keyword_window_secs")]
     pub keyword_window_secs: u64,
     pub stale_minutes: u64,
     pub format: Option<MessageFormat>,
@@ -1024,10 +1024,6 @@ pub(crate) fn tmux_bin() -> String {
 
 fn tmux_stderr(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_string()
-}
-
-fn default_keyword_window_secs() -> u64 {
-    30
 }
 
 pub fn current_timestamp_rfc3339() -> String {

@@ -192,7 +192,84 @@ async fn poll_github(
         };
 
         let previous = state.get(&repo.path);
-        let issues = match poll_issues(config, github_client, repo, &snapshot, previous, tx).await {
+
+        // Issues and PR comments share the same GitHub endpoint, so fetch it at
+        // most once per poll cycle and partition the result. On fetch error,
+        // carry forward previous state for both maps.
+        let raw_all_issues: Option<Result<Vec<GitHubIssue>>> = if let Some(client) =
+            github_client.filter(|_| repo.emit_issue_opened || repo.emit_pr_status)
+        {
+            Some(
+                fetch_all_issues_raw(client, &config.monitors.github_api_base, repo, &snapshot)
+                    .await,
+            )
+        } else {
+            None
+        };
+
+        let (prefetched_issues, prefetched_pr_comments) = match raw_all_issues {
+            None => (None, None),
+            Some(Ok(all)) => {
+                let issues_map: HashMap<u64, IssueSnapshot> = all
+                    .iter()
+                    .filter(|issue| !issue.is_pull_request())
+                    .map(|issue| {
+                        (
+                            issue.number,
+                            IssueSnapshot {
+                                title: issue.title.clone(),
+                                state: issue.state.clone(),
+                                comments: issue.comments,
+                            },
+                        )
+                    })
+                    .collect();
+                let pr_comments_map: HashMap<u64, IssueSnapshot> = all
+                    .into_iter()
+                    .filter(GitHubIssue::is_pull_request)
+                    .map(|issue| {
+                        (
+                            issue.number,
+                            IssueSnapshot {
+                                title: issue.title,
+                                state: issue.state,
+                                comments: issue.comments,
+                            },
+                        )
+                    })
+                    .collect();
+                (Some(issues_map), Some(pr_comments_map))
+            }
+            Some(Err(error)) => {
+                telemetry::emit(source_record(
+                    telemetry::event_name::SOURCE_DEGRADED,
+                    "source_poll_failed",
+                    Some(&repo.path),
+                    Some(error.to_string()),
+                ));
+                eprintln!(
+                    "clawhip source GitHub issues fetch failed for {}: {error}",
+                    repo.path
+                );
+                // Carry forward previous state for both maps on error.
+                let prev_issues = previous.map(|e| e.issues.clone()).unwrap_or_default();
+                let prev_pr_comments = previous.map(|e| e.pr_comments.clone()).unwrap_or_default();
+                let prs = previous.map(|e| e.prs.clone()).unwrap_or_default();
+                let ci = previous.map(|e| e.ci.clone()).unwrap_or_default();
+                state.insert(
+                    repo.path.clone(),
+                    GitHubRepoState {
+                        issues: prev_issues,
+                        pr_comments: prev_pr_comments,
+                        prs,
+                        ci,
+                    },
+                );
+                continue;
+            }
+        };
+
+        let issues = match poll_issues(repo, &snapshot, previous, prefetched_issues, tx).await {
             Ok(issues) => issues,
             Err(error) => {
                 eprintln!(
@@ -205,7 +282,7 @@ async fn poll_github(
             }
         };
         let pr_comments =
-            match poll_pr_comments(config, github_client, repo, &snapshot, previous, tx).await {
+            match poll_pr_comments(repo, &snapshot, previous, prefetched_pr_comments, tx).await {
                 Ok(comments) => comments,
                 Err(error) => {
                     eprintln!(
@@ -255,12 +332,33 @@ async fn poll_github(
     Ok(())
 }
 
+/// Task B: single fetch for the shared issues endpoint; callers partition the result.
+async fn fetch_all_issues_raw(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &GitRepoMonitor,
+    snapshot: &GitSnapshot,
+) -> Result<Vec<GitHubIssue>> {
+    let github_repo = snapshot
+        .github_repo
+        .clone()
+        .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
+    let response = github_get(
+        client,
+        api_base,
+        &format!("repos/{github_repo}/issues"),
+        &[("state", "all"), ("per_page", "100")],
+        &format!("issues+PRs for {github_repo}"),
+    )
+    .await?;
+    Ok(response.json::<Vec<GitHubIssue>>().await?)
+}
+
 async fn poll_pr_comments(
-    config: &AppConfig,
-    github_client: Option<&reqwest::Client>,
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
     previous: Option<&GitHubRepoState>,
+    prefetched: Option<HashMap<u64, IssueSnapshot>>,
     tx: &mpsc::Sender<IncomingEvent>,
 ) -> Result<HashMap<u64, IssueSnapshot>> {
     if !repo.emit_pr_status {
@@ -269,51 +367,27 @@ async fn poll_pr_comments(
             .unwrap_or_default());
     }
 
-    let Some(client) = github_client else {
+    let Some(comments) = prefetched else {
         return Ok(previous
             .map(|entry| entry.pr_comments.clone())
             .unwrap_or_default());
     };
 
-    match fetch_pr_comment_snapshots(client, &config.monitors.github_api_base, repo, snapshot).await
-    {
-        Ok(comments) => {
-            if let Some(previous) = previous {
-                for event in collect_pr_comment_events(
-                    repo,
-                    &snapshot.repo_name,
-                    &previous.pr_comments,
-                    &comments,
-                ) {
-                    send_event(tx, event).await?;
-                }
-            }
-            Ok(comments)
-        }
-        Err(error) => {
-            telemetry::emit(source_record(
-                telemetry::event_name::SOURCE_DEGRADED,
-                "source_poll_failed",
-                Some(&repo.path),
-                Some(error.to_string()),
-            ));
-            eprintln!(
-                "clawhip source GitHub PR comment polling failed for {}: {error}",
-                repo.path
-            );
-            Ok(previous
-                .map(|entry| entry.pr_comments.clone())
-                .unwrap_or_default())
+    if let Some(previous) = previous {
+        for event in
+            collect_pr_comment_events(repo, &snapshot.repo_name, &previous.pr_comments, &comments)
+        {
+            send_event(tx, event).await?;
         }
     }
+    Ok(comments)
 }
 
 async fn poll_issues(
-    config: &AppConfig,
-    github_client: Option<&reqwest::Client>,
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
     previous: Option<&GitHubRepoState>,
+    prefetched: Option<HashMap<u64, IssueSnapshot>>,
     tx: &mpsc::Sender<IncomingEvent>,
 ) -> Result<HashMap<u64, IssueSnapshot>> {
     if !repo.emit_issue_opened {
@@ -322,39 +396,18 @@ async fn poll_issues(
             .unwrap_or_default());
     }
 
-    let Some(client) = github_client else {
+    let Some(issues) = prefetched else {
         return Ok(previous
             .map(|entry| entry.issues.clone())
             .unwrap_or_default());
     };
 
-    match fetch_issues(client, &config.monitors.github_api_base, repo, snapshot).await {
-        Ok(issues) => {
-            if let Some(previous) = previous {
-                for event in
-                    collect_issue_events(repo, &snapshot.repo_name, &previous.issues, &issues)
-                {
-                    send_event(tx, event).await?;
-                }
-            }
-            Ok(issues)
-        }
-        Err(error) => {
-            telemetry::emit(source_record(
-                telemetry::event_name::SOURCE_DEGRADED,
-                "source_poll_failed",
-                Some(&repo.path),
-                Some(error.to_string()),
-            ));
-            eprintln!(
-                "clawhip source GitHub issue polling failed for {}: {error}",
-                repo.path
-            );
-            Ok(previous
-                .map(|entry| entry.issues.clone())
-                .unwrap_or_default())
+    if let Some(previous) = previous {
+        for event in collect_issue_events(repo, &snapshot.repo_name, &previous.issues, &issues) {
+            send_event(tx, event).await?;
         }
     }
+    Ok(issues)
 }
 
 async fn poll_pull_requests(
@@ -655,76 +708,6 @@ fn collect_ci_events(
             })
     });
     events
-}
-
-async fn fetch_issues(
-    client: &reqwest::Client,
-    api_base: &str,
-    repo: &GitRepoMonitor,
-    snapshot: &GitSnapshot,
-) -> Result<HashMap<u64, IssueSnapshot>> {
-    let github_repo = snapshot
-        .github_repo
-        .clone()
-        .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
-    let response = github_get(
-        client,
-        api_base,
-        &format!("repos/{github_repo}/issues"),
-        &[("state", "all"), ("per_page", "100")],
-        &format!("issues for {github_repo}"),
-    )
-    .await?;
-    let issues: Vec<GitHubIssue> = response.json().await?;
-    Ok(issues
-        .into_iter()
-        .filter(|issue| !issue.is_pull_request())
-        .map(|issue| {
-            (
-                issue.number,
-                IssueSnapshot {
-                    title: issue.title,
-                    state: issue.state,
-                    comments: issue.comments,
-                },
-            )
-        })
-        .collect())
-}
-
-async fn fetch_pr_comment_snapshots(
-    client: &reqwest::Client,
-    api_base: &str,
-    repo: &GitRepoMonitor,
-    snapshot: &GitSnapshot,
-) -> Result<HashMap<u64, IssueSnapshot>> {
-    let github_repo = snapshot
-        .github_repo
-        .clone()
-        .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
-    let response = github_get(
-        client,
-        api_base,
-        &format!("repos/{github_repo}/issues"),
-        &[("state", "all"), ("per_page", "100")],
-        &format!("PR issue comment snapshots for {github_repo}"),
-    )
-    .await?;
-    let issues: Vec<GitHubIssue> = response.json().await?;
-    Ok(issues
-        .into_iter()
-        .filter(GitHubIssue::is_pull_request)
-        .map(|issue| {
-            (
-                issue.number,
-                IssueSnapshot {
-                    title: issue.title,
-                    state: issue.state,
-                    comments: issue.comments,
-                },
-            )
-        })
-        .collect())
 }
 
 async fn fetch_pull_requests(

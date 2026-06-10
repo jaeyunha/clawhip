@@ -230,6 +230,14 @@ impl RouteRule {
     }
 }
 
+/// Maps a git repo name to an owner string for session ownership inference.
+/// TOML: `[[monitors.session_owners]] repo = "my-repo" owner = "alice"`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionOwnerMapping {
+    pub repo: String,
+    pub owner: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorConfig {
     #[serde(default = "default_poll_interval")]
@@ -245,6 +253,17 @@ pub struct MonitorConfig {
     pub tmux: TmuxMonitorConfig,
     #[serde(default)]
     pub workspace: Vec<WorkspaceMonitor>,
+    /// Config-driven repo-name → owner mappings (replaces hardcoded personal names).
+    #[serde(default)]
+    pub session_owners: Vec<SessionOwnerMapping>,
+    /// Tmux session name prefixes that indicate infra candidate sessions.
+    /// Empty by default — behaviour is opt-in.
+    #[serde(default)]
+    pub infra_session_prefixes: Vec<String>,
+    /// Worktree root directories used by `lane inspect` / `lane board`.
+    /// Falls back to these when no `--worktree-root` flag is supplied.
+    #[serde(default)]
+    pub lane_worktree_roots: Vec<String>,
 }
 
 impl Default for MonitorConfig {
@@ -258,6 +277,9 @@ impl Default for MonitorConfig {
             git: GitMonitorConfig::default(),
             tmux: TmuxMonitorConfig::default(),
             workspace: Vec::new(),
+            session_owners: Vec::new(),
+            infra_session_prefixes: Vec::new(),
+            lane_worktree_roots: Vec::new(),
         }
     }
 }
