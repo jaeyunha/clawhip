@@ -7,3 +7,4 @@ target/
 .clawhip/state/
 MEMORY.md
 memory/
+.handoffs/
