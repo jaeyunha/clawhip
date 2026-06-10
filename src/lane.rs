@@ -6,17 +6,11 @@ use crate::cli::{LaneInspectArgs, LaneVerifyArgs, LaneWorktreesArgs};
 use crate::config::AppConfig;
 use crate::source::tmux::tmux_bin;
 
-// Task C: reuse async source/tmux helpers for session listing.
-// Task A: board takes config for lane_worktree_roots.
-// Task E: timeout_secs removed from run(); run_shell and args_with_program deleted.
-
 pub async fn board(args: LaneInspectArgs, config: &AppConfig) -> Result<()> {
     print_clawhip_tmux()?;
     println!();
     print_tmux_panes().await?;
 
-    // Task A: --worktree-root flags win; fall back to config roots;
-    // if neither is present, print a note and skip.
     let roots: Vec<PathBuf> = if !args.worktree_root.is_empty() {
         args.worktree_root
     } else if !config.monitors.lane_worktree_roots.is_empty() {
@@ -342,7 +336,6 @@ fn is_git_worktree(path: &Path) -> bool {
     .is_some_and(|out| out.status.success() && out.stdout.trim() == "true")
 }
 
-// Task C: pane data type used only within lane.rs; populated from tmux CLI.
 #[derive(Debug, Default)]
 struct TmuxPaneInfo {
     session: String,
@@ -467,7 +460,6 @@ struct CmdOutput {
     stderr: String,
 }
 
-// Task E: timeout_secs parameter removed.
 fn run(args: &[&str], cwd: Option<&Path>) -> Result<CmdOutput> {
     let mut command = Command::new(args[0]);
     command.args(&args[1..]);

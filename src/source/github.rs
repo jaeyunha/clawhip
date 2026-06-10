@@ -332,7 +332,7 @@ async fn poll_github(
     Ok(())
 }
 
-/// Task B: single fetch for the shared issues endpoint; callers partition the result.
+/// Issues and PR comments share this endpoint; callers partition the result.
 async fn fetch_all_issues_raw(
     client: &reqwest::Client,
     api_base: &str,
