@@ -4,6 +4,11 @@ This fork (github.com:jaeyunha/clawhip) layers agent-ops behavior on top of
 upstream clawhip (github.com:Yeachan-Heo/clawhip). This file is the map for
 humans and agents doing upstream merges or deciding where new code belongs.
 
+**Direction is pull-only.** We periodically merge upstream in; we never
+contribute back. Don't spend effort making changes PR-able to upstream —
+the only reason to keep upstream-facing modules low-diff is to keep our own
+upstream merges cheap.
+
 ## What is fork-specific
 
 | Concern | Where it lives |
@@ -33,7 +38,8 @@ and owners go in config; source modules stay generic.
 ## Upstream merge rules
 
 - Keep `src/source/*`, `src/discord*.rs`, `src/router.rs`, `src/dispatch.rs`
-  upstream-shaped: generic mechanisms, no personal policy.
+  close to upstream's shape — not for contributing back (we don't), but so
+  upstream merges land with few conflicts.
 - Fork-only modules (`src/ledger.rs`, `src/lane.rs`, `src/shell.rs`) rarely
   conflict; conflicts concentrate in `src/daemon.rs`, `src/main.rs`,
   `src/cli.rs`, `src/events.rs` where the fork hooks into upstream flow.
