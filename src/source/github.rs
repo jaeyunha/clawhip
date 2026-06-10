@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -64,13 +64,75 @@ struct GitHubRepoState {
     pr_comments: HashMap<u64, IssueSnapshot>,
     prs: HashMap<u64, PullRequestSnapshot>,
     ci: HashMap<String, GitHubCISnapshot>,
+    issue_high_water_mark: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct IssueSnapshot {
     title: String,
     state: String,
     comments: u64,
+}
+
+/// Issue state persisted in the ledger across daemon restarts so issue
+/// activity during downtime is replayed instead of silently baselined away.
+#[derive(Default, Serialize, Deserialize)]
+struct IssueBaseline {
+    /// Highest issue/PR number observed for the repo. Issues and PRs share
+    /// one number space, so anything above this is genuinely new, while an
+    /// unknown number at or below it is an old issue that re-entered the
+    /// poll window via an update.
+    high_water_mark: u64,
+    issues: HashMap<u64, IssueSnapshot>,
+}
+
+fn load_issue_baseline(repo_path: &str) -> Option<IssueBaseline> {
+    let ledger = match crate::ledger::Ledger::open_default() {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            eprintln!(
+                "clawhip source github: failed to open ledger for issue baseline of {repo_path}: {error}"
+            );
+            return None;
+        }
+    };
+    let payload = match ledger.github_issue_baseline(repo_path) {
+        Ok(payload) => payload?,
+        Err(error) => {
+            eprintln!(
+                "clawhip source github: failed to load issue baseline for {repo_path}: {error}"
+            );
+            return None;
+        }
+    };
+    match serde_json::from_str(&payload) {
+        Ok(baseline) => Some(baseline),
+        Err(error) => {
+            eprintln!(
+                "clawhip source github: discarding unreadable issue baseline for {repo_path}: {error}"
+            );
+            None
+        }
+    }
+}
+
+fn store_issue_baseline(repo_path: &str, baseline: &IssueBaseline) {
+    let payload = match serde_json::to_string(baseline) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!(
+                "clawhip source github: failed to serialize issue baseline for {repo_path}: {error}"
+            );
+            return;
+        }
+    };
+    if let Err(error) = crate::ledger::Ledger::open_default()
+        .and_then(|ledger| ledger.set_github_issue_baseline(repo_path, &payload))
+    {
+        eprintln!(
+            "clawhip source github: failed to persist issue baseline for {repo_path}: {error}"
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -193,6 +255,19 @@ async fn poll_github(
 
         let previous = state.get(&repo.path);
 
+        // On the first poll after startup, the persisted baseline stands in
+        // for in-memory state so issue activity during downtime is replayed
+        // instead of silently re-baselined.
+        let baseline = if previous.is_none() && repo.emit_issue_opened {
+            load_issue_baseline(&repo.path)
+        } else {
+            None
+        };
+        let prior_hwm = previous
+            .map(|entry| entry.issue_high_water_mark)
+            .or_else(|| baseline.as_ref().map(|b| b.high_water_mark))
+            .unwrap_or(0);
+
         // Issues and PR comments share the same GitHub endpoint, so fetch it at
         // most once per poll cycle and partition the result. On fetch error,
         // carry forward previous state for both maps.
@@ -207,9 +282,12 @@ async fn poll_github(
             None
         };
 
-        let (prefetched_issues, prefetched_pr_comments) = match raw_all_issues {
-            None => (None, None),
+        let (prefetched_issues, prefetched_pr_comments, fetched_max) = match raw_all_issues {
+            None => (None, None, None),
             Some(Ok(all)) => {
+                // Highest number across issues AND PRs: they share one number
+                // space, so this is the open-floor for "genuinely new".
+                let max_number = all.iter().map(|issue| issue.number).max();
                 let issues_map: HashMap<u64, IssueSnapshot> = all
                     .iter()
                     .filter(|issue| !issue.is_pull_request())
@@ -238,7 +316,7 @@ async fn poll_github(
                         )
                     })
                     .collect();
-                (Some(issues_map), Some(pr_comments_map))
+                (Some(issues_map), Some(pr_comments_map), max_number)
             }
             Some(Err(error)) => {
                 telemetry::emit(source_record(
@@ -263,13 +341,23 @@ async fn poll_github(
                         pr_comments: prev_pr_comments,
                         prs,
                         ci,
+                        issue_high_water_mark: prior_hwm,
                     },
                 );
                 continue;
             }
         };
 
-        let issues = match poll_issues(repo, &snapshot, previous, prefetched_issues, tx).await {
+        let issues = match poll_issues(
+            repo,
+            &snapshot,
+            previous,
+            baseline.as_ref(),
+            prefetched_issues,
+            tx,
+        )
+        .await
+        {
             Ok(issues) => issues,
             Err(error) => {
                 eprintln!(
@@ -318,6 +406,25 @@ async fn poll_github(
             }
         };
 
+        let issue_high_water_mark = prior_hwm.max(fetched_max.unwrap_or(0));
+        if repo.emit_issue_opened && fetched_max.is_some() {
+            // Persist only on change so steady-state polling stays write-free.
+            let unchanged = issue_high_water_mark == prior_hwm
+                && previous
+                    .map(|entry| &entry.issues)
+                    .or_else(|| baseline.as_ref().map(|b| &b.issues))
+                    .is_some_and(|prev| *prev == issues);
+            if !unchanged {
+                store_issue_baseline(
+                    &repo.path,
+                    &IssueBaseline {
+                        high_water_mark: issue_high_water_mark,
+                        issues: issues.clone(),
+                    },
+                );
+            }
+        }
+
         state.insert(
             repo.path.clone(),
             GitHubRepoState {
@@ -325,6 +432,7 @@ async fn poll_github(
                 pr_comments,
                 prs,
                 ci,
+                issue_high_water_mark,
             },
         );
     }
@@ -387,6 +495,7 @@ async fn poll_issues(
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
     previous: Option<&GitHubRepoState>,
+    baseline: Option<&IssueBaseline>,
     prefetched: Option<HashMap<u64, IssueSnapshot>>,
     tx: &mpsc::Sender<IncomingEvent>,
 ) -> Result<HashMap<u64, IssueSnapshot>> {
@@ -404,6 +513,27 @@ async fn poll_issues(
 
     if let Some(previous) = previous {
         for event in collect_issue_events(repo, &snapshot.repo_name, &previous.issues, &issues) {
+            send_event(tx, event).await?;
+        }
+    } else if let Some(baseline) = baseline {
+        let events = collect_issue_replay_events(repo, &snapshot.repo_name, baseline, &issues);
+        if !events.is_empty() {
+            telemetry::emit(source_record(
+                telemetry::event_name::SOURCE_INVENTORY,
+                "github_issue_replay",
+                Some(&repo.path),
+                Some(format!(
+                    "replaying {} issue event(s) missed while the daemon was down",
+                    events.len()
+                )),
+            ));
+            eprintln!(
+                "clawhip source github: replaying {} issue event(s) for {} missed while the daemon was down",
+                events.len(),
+                repo.path
+            );
+        }
+        for event in events {
             send_event(tx, event).await?;
         }
     }
@@ -585,10 +715,38 @@ fn collect_issue_events(
     previous: &HashMap<u64, IssueSnapshot>,
     current: &HashMap<u64, IssueSnapshot>,
 ) -> Vec<IncomingEvent> {
+    collect_issue_events_with_open_floor(repo, repo_name, previous, current, None)
+}
+
+/// Diff issue snapshots against a persisted baseline from before a restart.
+/// The baseline's high-water mark gates "opened" events: an unknown number at
+/// or below it is an old issue that re-entered the poll window, not a new one.
+fn collect_issue_replay_events(
+    repo: &GitRepoMonitor,
+    repo_name: &str,
+    baseline: &IssueBaseline,
+    current: &HashMap<u64, IssueSnapshot>,
+) -> Vec<IncomingEvent> {
+    collect_issue_events_with_open_floor(
+        repo,
+        repo_name,
+        &baseline.issues,
+        current,
+        Some(baseline.high_water_mark),
+    )
+}
+
+fn collect_issue_events_with_open_floor(
+    repo: &GitRepoMonitor,
+    repo_name: &str,
+    previous: &HashMap<u64, IssueSnapshot>,
+    current: &HashMap<u64, IssueSnapshot>,
+    open_floor: Option<u64>,
+) -> Vec<IncomingEvent> {
     let mut events = Vec::new();
     for (number, issue) in current {
         match previous.get(number) {
-            None => events.push(
+            None if open_floor.is_none_or(|floor| *number > floor) => events.push(
                 IncomingEvent::github_issue_opened(
                     repo_name.to_string(),
                     *number,
@@ -598,6 +756,7 @@ fn collect_issue_events(
                 .with_mention(repo.mention.clone())
                 .with_format(repo.format.clone()),
             ),
+            None => {}
             Some(old) => {
                 if old.state != issue.state && issue.state == "closed" {
                     events.push(
@@ -1132,6 +1291,98 @@ mod tests {
                 .iter()
                 .any(|event| event.canonical_kind() == "github.issue-closed")
         );
+    }
+
+    #[test]
+    fn replay_events_use_high_water_mark_to_gate_opened_events() {
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            name: Some("clawhip".into()),
+            ..GitRepoMonitor::default()
+        };
+        let baseline = IssueBaseline {
+            high_water_mark: 10,
+            issues: [(
+                2_u64,
+                IssueSnapshot {
+                    title: "live issue".into(),
+                    state: "open".into(),
+                    comments: 0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let current = [
+            (
+                2_u64,
+                IssueSnapshot {
+                    title: "live issue".into(),
+                    state: "closed".into(),
+                    comments: 3,
+                },
+            ),
+            (
+                11_u64,
+                IssueSnapshot {
+                    title: "new while down".into(),
+                    state: "open".into(),
+                    comments: 0,
+                },
+            ),
+            // Old issue below the high-water mark that re-entered the poll
+            // window via a comment; it must NOT fire issue-opened.
+            (
+                5_u64,
+                IssueSnapshot {
+                    title: "old issue back in window".into(),
+                    state: "open".into(),
+                    comments: 7,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let events = collect_issue_replay_events(&repo, "clawhip", &baseline, &current);
+        let opened: Vec<_> = events
+            .iter()
+            .filter(|event| event.canonical_kind() == "github.issue-opened")
+            .collect();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].payload["number"], 11);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.canonical_kind() == "github.issue-closed"
+                    && event.payload["number"] == 2)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.canonical_kind() == "github.issue-commented"
+                    && event.payload["number"] == 2)
+        );
+    }
+
+    #[test]
+    fn issue_baseline_round_trips_through_serde() {
+        let baseline = IssueBaseline {
+            high_water_mark: 42,
+            issues: [(
+                7_u64,
+                IssueSnapshot {
+                    title: "persisted".into(),
+                    state: "open".into(),
+                    comments: 1,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let payload = serde_json::to_string(&baseline).unwrap();
+        let restored: IssueBaseline = serde_json::from_str(&payload).unwrap();
+        assert_eq!(restored.high_water_mark, 42);
+        assert_eq!(restored.issues, baseline.issues);
     }
 
     #[test]

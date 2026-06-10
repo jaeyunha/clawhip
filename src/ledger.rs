@@ -108,6 +108,12 @@ impl Ledger {
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_intents_session_unique
                 ON watch_intents(session_id);
+
+            CREATE TABLE IF NOT EXISTS github_issue_baselines (
+                repo_path TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             "#,
         )?;
         self.ensure_column(
@@ -153,6 +159,29 @@ impl Ledger {
             .query_map([], |row| row.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    pub fn github_issue_baseline(&self, repo_path: &str) -> Result<Option<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT payload FROM github_issue_baselines WHERE repo_path = ?1")?;
+        let mut rows = statement.query_map(params![repo_path], |row| row.get::<_, String>(0))?;
+        match rows.next() {
+            Some(payload) => Ok(Some(payload?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_github_issue_baseline(&self, repo_path: &str, payload: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO github_issue_baselines (repo_path, payload, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(repo_path) DO UPDATE SET
+                 payload = excluded.payload,
+                 updated_at = excluded.updated_at",
+            params![repo_path, payload, now_rfc3339()],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_session(&self, input: SessionInput) -> Result<SessionRecord> {
@@ -1103,6 +1132,32 @@ mod tests {
         assert_eq!(
             ledger.applied_schema_versions().unwrap(),
             vec![SCHEMA_VERSION]
+        );
+    }
+
+    #[test]
+    fn github_issue_baseline_round_trip() {
+        let ledger = Ledger::open_memory().expect("ledger");
+        assert_eq!(ledger.github_issue_baseline("/tmp/repo").unwrap(), None);
+        ledger
+            .set_github_issue_baseline("/tmp/repo", "{\"high_water_mark\":3}")
+            .expect("insert baseline");
+        assert_eq!(
+            ledger
+                .github_issue_baseline("/tmp/repo")
+                .unwrap()
+                .as_deref(),
+            Some("{\"high_water_mark\":3}")
+        );
+        ledger
+            .set_github_issue_baseline("/tmp/repo", "{\"high_water_mark\":7}")
+            .expect("overwrite baseline");
+        assert_eq!(
+            ledger
+                .github_issue_baseline("/tmp/repo")
+                .unwrap()
+                .as_deref(),
+            Some("{\"high_water_mark\":7}")
         );
     }
 
