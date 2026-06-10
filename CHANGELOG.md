@@ -5,11 +5,13 @@
 ### Highlights
 
 - add local file sinks and skip idle tmux polling so operators can archive routing output without noisy dead-pane sweeps
+- rename missing tmux lane board status to `tmux-missing` so operators do not confuse a disappeared session with completed work
 - move CI/release execution onto the self-hosted GAJAE runner path and keep runner prerequisite failures actionable
 - prevent terminal tmux watches from dispatching stale alerts after sessions complete or panes disappear
 - add a recipe-first documentation front door for faster operator setup
 - surface operator questions from native ask tools without losing route context
 - support explicit Discord thread routing targets with redacted diagnostics and telemetry
+- support dynamic per-lane Discord thread targets for `clawhip tmux new/watch`, including ledger restore and correlated `session.*` routing
 - add gateway allowlist verification so route/channel drift is caught before dispatch
 - expose the GAJAE CLI bridge for local profile/status dogfooding
 - add a disabled-by-default Discord watch sidecar that persists local nudge intents without live dispatch

@@ -49,6 +49,8 @@ pub struct IncomingEvent {
     #[serde(default)]
     pub channel: Option<String>,
     #[serde(default)]
+    pub source_target: Option<EventTargetHint>,
+    #[serde(default)]
     pub mention: Option<String>,
     #[serde(default)]
     pub format: Option<MessageFormat>,
@@ -56,6 +58,13 @@ pub struct IncomingEvent {
     pub template: Option<String>,
     #[serde(default)]
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "id", rename_all = "kebab-case")]
+pub enum EventTargetHint {
+    DiscordChannel(String),
+    DiscordThread(String),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +92,8 @@ struct IncomingEventWire {
     #[serde(default)]
     channel: Option<String>,
     #[serde(default)]
+    source_target: Option<EventTargetHint>,
+    #[serde(default)]
     mention: Option<String>,
     #[serde(default)]
     format: Option<MessageFormat>,
@@ -107,6 +118,7 @@ impl<'de> Deserialize<'de> for IncomingEvent {
         Ok(Self {
             kind: wire.kind,
             channel: wire.channel,
+            source_target: wire.source_target,
             mention: wire.mention,
             format: wire.format,
             template: wire.template,
@@ -120,6 +132,7 @@ impl IncomingEvent {
         Self {
             kind,
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -131,6 +144,7 @@ impl IncomingEvent {
         Self {
             kind: "custom".to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -176,6 +190,7 @@ impl IncomingEvent {
         Self {
             kind: kind.to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -286,6 +301,7 @@ impl IncomingEvent {
         Self {
             kind: "github.issue-opened".to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -303,6 +319,25 @@ impl IncomingEvent {
         Self {
             kind: "github.issue-commented".to_string(),
             channel,
+            source_target: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({ "repo": repo, "number": number, "title": title, "comments": comments }),
+        }
+    }
+
+    pub fn github_pr_commented(
+        repo: String,
+        number: u64,
+        title: String,
+        comments: u64,
+        channel: Option<String>,
+    ) -> Self {
+        Self {
+            kind: "github.pr-commented".to_string(),
+            channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -319,6 +354,7 @@ impl IncomingEvent {
         Self {
             kind: "github.issue-closed".to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -336,6 +372,7 @@ impl IncomingEvent {
         Self {
             kind: "git.commit".to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -383,6 +420,7 @@ impl IncomingEvent {
         vec![Self {
             kind: "git.commit".to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -407,6 +445,7 @@ impl IncomingEvent {
         Self {
             kind: "git.branch-changed".to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -430,6 +469,7 @@ impl IncomingEvent {
         Self {
             kind: "github.pr-status-changed".to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -476,6 +516,7 @@ impl IncomingEvent {
         Self {
             kind: kind.to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -513,6 +554,7 @@ impl IncomingEvent {
         Self {
             kind: kind.to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -525,6 +567,7 @@ impl IncomingEvent {
         Self {
             kind: "discord.message-create".to_string(),
             channel: Some(message.channel_id.clone()),
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -541,6 +584,7 @@ impl IncomingEvent {
         Self {
             kind: "tmux.keyword".to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -580,6 +624,7 @@ impl IncomingEvent {
         Self {
             kind: "tmux.keyword".to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -606,6 +651,7 @@ impl IncomingEvent {
         Self {
             kind: "tmux.stale".to_string(),
             channel,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -625,6 +671,11 @@ impl IncomingEvent {
 
     pub fn with_format(mut self, format: Option<MessageFormat>) -> Self {
         self.format = format;
+        self
+    }
+
+    pub fn with_source_target(mut self, source_target: Option<EventTargetHint>) -> Self {
+        self.source_target = source_target;
         self
     }
 
@@ -1446,6 +1497,7 @@ mod tests {
         let event = normalize_event(IncomingEvent {
             kind: "notify".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1796,6 +1848,7 @@ mod tests {
         let event = normalize_event(IncomingEvent {
             kind: "agent.finished".into(),
             channel: None,
+            source_target: None,
             mention: Some("<@123>".into()),
             format: None,
             template: None,
@@ -1849,6 +1902,7 @@ mod tests {
         let event = normalize_event(IncomingEvent {
             kind: "notify".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1890,6 +1944,7 @@ mod tests {
         let event = normalize_event(IncomingEvent {
             kind: "session-start".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1936,6 +1991,7 @@ mod tests {
         let event = normalize_event(IncomingEvent {
             kind: "post-tool-use".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1980,6 +2036,7 @@ mod tests {
         let event = normalize_event(IncomingEvent {
             kind: "post-tool-use".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -2020,6 +2077,7 @@ mod tests {
         let event = normalize_event(IncomingEvent {
             kind: "post-tool-use".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -2049,6 +2107,7 @@ mod tests {
         let event = normalize_event(IncomingEvent {
             kind: "pr-created".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -2197,6 +2256,7 @@ mod tests {
             let event = IncomingEvent {
                 kind: kind.into(),
                 channel: None,
+                source_target: None,
                 mention: None,
                 format: None,
                 template: None,
@@ -2238,6 +2298,7 @@ mod tests {
             let event = normalize_event(IncomingEvent {
                 kind: kind.into(),
                 channel: None,
+                source_target: None,
                 mention: None,
                 format: None,
                 template: None,
@@ -2254,6 +2315,7 @@ mod tests {
         let event = normalize_event(IncomingEvent {
             kind: "question.requested".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,

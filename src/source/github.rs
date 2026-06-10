@@ -5,6 +5,8 @@ use std::time::Duration;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
 use serde_json::json;
+use time::format_description::well_known::Rfc3339;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
@@ -59,6 +61,7 @@ impl Source for GitHubSource {
 
 struct GitHubRepoState {
     issues: HashMap<u64, IssueSnapshot>,
+    pr_comments: HashMap<u64, IssueSnapshot>,
     prs: HashMap<u64, PullRequestSnapshot>,
     ci: HashMap<String, GitHubCISnapshot>,
 }
@@ -201,6 +204,19 @@ async fn poll_github(
                     .unwrap_or_default()
             }
         };
+        let pr_comments =
+            match poll_pr_comments(config, github_client, repo, &snapshot, previous, tx).await {
+                Ok(comments) => comments,
+                Err(error) => {
+                    eprintln!(
+                        "clawhip source GitHub PR comment processing failed for {}: {error}",
+                        repo.path
+                    );
+                    previous
+                        .map(|entry| entry.pr_comments.clone())
+                        .unwrap_or_default()
+                }
+            };
         let prs =
             match poll_pull_requests(config, github_client, repo, &snapshot, previous, tx).await {
                 Ok(prs) => prs,
@@ -225,10 +241,71 @@ async fn poll_github(
             }
         };
 
-        state.insert(repo.path.clone(), GitHubRepoState { issues, prs, ci });
+        state.insert(
+            repo.path.clone(),
+            GitHubRepoState {
+                issues,
+                pr_comments,
+                prs,
+                ci,
+            },
+        );
     }
 
     Ok(())
+}
+
+async fn poll_pr_comments(
+    config: &AppConfig,
+    github_client: Option<&reqwest::Client>,
+    repo: &GitRepoMonitor,
+    snapshot: &GitSnapshot,
+    previous: Option<&GitHubRepoState>,
+    tx: &mpsc::Sender<IncomingEvent>,
+) -> Result<HashMap<u64, IssueSnapshot>> {
+    if !repo.emit_pr_status {
+        return Ok(previous
+            .map(|entry| entry.pr_comments.clone())
+            .unwrap_or_default());
+    }
+
+    let Some(client) = github_client else {
+        return Ok(previous
+            .map(|entry| entry.pr_comments.clone())
+            .unwrap_or_default());
+    };
+
+    match fetch_pr_comment_snapshots(client, &config.monitors.github_api_base, repo, snapshot).await
+    {
+        Ok(comments) => {
+            if let Some(previous) = previous {
+                for event in collect_pr_comment_events(
+                    repo,
+                    &snapshot.repo_name,
+                    &previous.pr_comments,
+                    &comments,
+                ) {
+                    send_event(tx, event).await?;
+                }
+            }
+            Ok(comments)
+        }
+        Err(error) => {
+            telemetry::emit(source_record(
+                telemetry::event_name::SOURCE_DEGRADED,
+                "source_poll_failed",
+                Some(&repo.path),
+                Some(error.to_string()),
+            ));
+            eprintln!(
+                "clawhip source GitHub PR comment polling failed for {}: {error}",
+                repo.path
+            );
+            Ok(previous
+                .map(|entry| entry.pr_comments.clone())
+                .unwrap_or_default())
+        }
+    }
 }
 
 async fn poll_issues(
@@ -370,6 +447,7 @@ async fn poll_ci_statuses(
         repo,
         snapshot,
         &open_prs,
+        config.monitors.github_direct_workflow_run_max_age_secs,
     )
     .await
     {
@@ -499,6 +577,33 @@ fn collect_issue_events(
     events
 }
 
+fn collect_pr_comment_events(
+    repo: &GitRepoMonitor,
+    repo_name: &str,
+    previous: &HashMap<u64, IssueSnapshot>,
+    current: &HashMap<u64, IssueSnapshot>,
+) -> Vec<IncomingEvent> {
+    let mut events = Vec::new();
+    for (number, pr) in current {
+        if let Some(old) = previous.get(number)
+            && pr.comments > old.comments
+        {
+            events.push(
+                IncomingEvent::github_pr_commented(
+                    repo_name.to_string(),
+                    *number,
+                    pr.title.clone(),
+                    pr.comments,
+                    repo.channel.clone(),
+                )
+                .with_mention(repo.mention.clone())
+                .with_format(repo.format.clone()),
+            );
+        }
+    }
+    events
+}
+
 fn collect_ci_events(
     repo: &GitRepoMonitor,
     repo_name: &str,
@@ -587,6 +692,41 @@ async fn fetch_issues(
         .collect())
 }
 
+async fn fetch_pr_comment_snapshots(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &GitRepoMonitor,
+    snapshot: &GitSnapshot,
+) -> Result<HashMap<u64, IssueSnapshot>> {
+    let github_repo = snapshot
+        .github_repo
+        .clone()
+        .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
+    let response = github_get(
+        client,
+        api_base,
+        &format!("repos/{github_repo}/issues"),
+        &[("state", "all"), ("per_page", "100")],
+        &format!("PR issue comment snapshots for {github_repo}"),
+    )
+    .await?;
+    let issues: Vec<GitHubIssue> = response.json().await?;
+    Ok(issues
+        .into_iter()
+        .filter(GitHubIssue::is_pull_request)
+        .map(|issue| {
+            (
+                issue.number,
+                IssueSnapshot {
+                    title: issue.title,
+                    state: issue.state,
+                    comments: issue.comments,
+                },
+            )
+        })
+        .collect())
+}
+
 async fn fetch_pull_requests(
     client: &reqwest::Client,
     api_base: &str,
@@ -634,6 +774,7 @@ async fn fetch_ci_statuses(
     repo: &GitRepoMonitor,
     snapshot: &GitSnapshot,
     open_prs: &[(u64, &PullRequestSnapshot)],
+    direct_workflow_run_max_age_secs: u64,
 ) -> Result<HashMap<String, GitHubCISnapshot>> {
     let github_repo = snapshot
         .github_repo
@@ -651,7 +792,14 @@ async fn fetch_ci_statuses(
         }
     }
 
-    for workflow_run in fetch_direct_workflow_runs(client, api_base, &github_repo, snapshot).await?
+    for workflow_run in fetch_direct_workflow_runs(
+        client,
+        api_base,
+        &github_repo,
+        snapshot,
+        direct_workflow_run_max_age_secs,
+    )
+    .await?
     {
         if workflow_run
             .run_id
@@ -728,6 +876,7 @@ async fn fetch_direct_workflow_runs(
     api_base: &str,
     github_repo: &str,
     snapshot: &GitSnapshot,
+    max_age_secs: u64,
 ) -> Result<Vec<GitHubCISnapshot>> {
     let mut query = vec![("per_page", "100"), ("event", "push")];
     if !snapshot.branch.is_empty() {
@@ -744,10 +893,12 @@ async fn fetch_direct_workflow_runs(
     .await?;
 
     let runs: GitHubWorkflowRunsResponse = response.json().await?;
+    let now = OffsetDateTime::now_utc();
     Ok(runs
         .workflow_runs
         .into_iter()
         .filter(|run| run.pull_requests.is_empty())
+        .filter(|run| !is_stale_completed_direct_workflow_run(run, now, max_age_secs))
         .map(|run| {
             let run_all_terminal = run.status == "completed";
             GitHubCISnapshot {
@@ -766,6 +917,20 @@ async fn fetch_direct_workflow_runs(
             }
         })
         .collect())
+}
+
+fn is_stale_completed_direct_workflow_run(
+    run: &GitHubWorkflowRun,
+    now: OffsetDateTime,
+    max_age_secs: u64,
+) -> bool {
+    if max_age_secs == 0 || run.status != "completed" {
+        return false;
+    }
+    let Ok(updated_at) = OffsetDateTime::parse(&run.updated_at, &Rfc3339) else {
+        return false;
+    };
+    now - updated_at > TimeDuration::seconds(max_age_secs as i64)
 }
 
 fn workflow_run_id(url: &str) -> Option<String> {
@@ -846,7 +1011,7 @@ struct GitHubWorkflowRunsResponse {
     workflow_runs: Vec<GitHubWorkflowRun>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct GitHubWorkflowRun {
     id: u64,
     #[serde(default)]
@@ -856,6 +1021,7 @@ struct GitHubWorkflowRun {
     head_branch: String,
     head_sha: String,
     html_url: String,
+    updated_at: String,
     #[serde(default)]
     pull_requests: Vec<serde_json::Value>,
 }
@@ -985,6 +1151,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pr_comment_events_are_emitted_from_pr_issue_comment_counts() {
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip".into(),
+            name: Some("clawhip".into()),
+            ..GitRepoMonitor::default()
+        };
+        let previous = [(
+            12_u64,
+            IssueSnapshot {
+                title: "live pr".into(),
+                state: "open".into(),
+                comments: 2,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let current = [(
+            12_u64,
+            IssueSnapshot {
+                title: "live pr".into(),
+                state: "open".into(),
+                comments: 3,
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        let events = collect_pr_comment_events(&repo, "clawhip", &previous, &current);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].canonical_kind(), "github.pr-commented");
+        assert_eq!(events[0].payload["number"], serde_json::json!(12));
+        assert_eq!(events[0].payload["comments"], serde_json::json!(3));
+    }
+
     fn ci_snapshot(
         pr_number: u64,
         workflow: &str,
@@ -1003,6 +1205,54 @@ mod tests {
             run_job_count: 1,
             run_all_terminal: status == "completed",
         }
+    }
+
+    #[test]
+    fn stale_direct_workflow_guard_only_suppresses_old_completed_runs() {
+        let now = OffsetDateTime::parse("2026-06-08T00:10:00Z", &Rfc3339).unwrap();
+        let old_completed = GitHubWorkflowRun {
+            id: 1,
+            name: Some("CI".into()),
+            status: "completed".into(),
+            conclusion: Some("failure".into()),
+            head_branch: "main".into(),
+            head_sha: "oldsha".into(),
+            html_url: "https://github.com/org/repo/actions/runs/1".into(),
+            updated_at: "2026-06-07T23:59:59Z".into(),
+            pull_requests: Vec::new(),
+        };
+        let recent_completed = GitHubWorkflowRun {
+            id: 2,
+            updated_at: "2026-06-08T00:05:01Z".into(),
+            ..old_completed.clone()
+        };
+        let old_in_progress = GitHubWorkflowRun {
+            id: 3,
+            status: "in_progress".into(),
+            updated_at: "2026-06-07T23:00:00Z".into(),
+            ..old_completed.clone()
+        };
+
+        assert!(is_stale_completed_direct_workflow_run(
+            &old_completed,
+            now,
+            600
+        ));
+        assert!(!is_stale_completed_direct_workflow_run(
+            &recent_completed,
+            now,
+            600
+        ));
+        assert!(!is_stale_completed_direct_workflow_run(
+            &old_in_progress,
+            now,
+            600
+        ));
+        assert!(!is_stale_completed_direct_workflow_run(
+            &old_completed,
+            now,
+            0
+        ));
     }
 
     #[tokio::test]
@@ -1025,6 +1275,7 @@ mod tests {
                     "head_branch": "main",
                     "head_sha": "deadbeef",
                     "html_url": "https://github.com/ultraworkers/claw-code/actions/runs/24007460067",
+                    "updated_at": "2999-01-01T00:00:00Z",
                     "pull_requests": []
                 }]
             })
@@ -1098,24 +1349,26 @@ mod tests {
                     "workflow_runs": [
                         {
                             "id": 123_u64,
-                            "name": "CI",
-                            "status": "completed",
-                            "conclusion": "failure",
-                            "head_branch": "feat/pr",
-                            "head_sha": "prsha",
-                            "html_url": "https://github.com/org/repo/actions/runs/123",
-                            "pull_requests": [{"number": 42}]
-                        },
-                        {
-                            "id": 456_u64,
-                            "name": "Rust CI",
-                            "status": "completed",
-                            "conclusion": "failure",
-                            "head_branch": "main",
-                            "head_sha": "mainsha",
-                            "html_url": "https://github.com/org/repo/actions/runs/456",
-                            "pull_requests": []
-                        }
+                                "name": "CI",
+                                "status": "completed",
+                                "conclusion": "failure",
+                                "head_branch": "feat/pr",
+                                "head_sha": "prsha",
+                                "html_url": "https://github.com/org/repo/actions/runs/123",
+                                "updated_at": "2999-01-01T00:00:00Z",
+                                "pull_requests": [{"number": 42}]
+                            },
+                            {
+                                "id": 456_u64,
+                                "name": "Rust CI",
+                                "status": "completed",
+                                "conclusion": "failure",
+                                "head_branch": "main",
+                                "head_sha": "mainsha",
+                                "html_url": "https://github.com/org/repo/actions/runs/456",
+                                "updated_at": "2999-01-01T00:00:00Z",
+                                "pull_requests": []
+                            }
                     ]
                 })
                 .to_string(),
@@ -1166,6 +1419,7 @@ mod tests {
             &GitRepoMonitor::default(),
             &snapshot,
             &open_prs,
+            600,
         )
         .await
         .unwrap();

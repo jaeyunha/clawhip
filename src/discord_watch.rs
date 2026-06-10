@@ -477,6 +477,7 @@ pub fn intent_to_local_event(intent: &NudgeIntent) -> IncomingEvent {
     IncomingEvent {
         kind: "discord-watch.nudge-intent".to_string(),
         channel: None,
+        source_target: None,
         mention: None,
         format: None,
         template: None,
@@ -948,6 +949,7 @@ mod tests {
         let event = IncomingEvent {
             kind: "discord.message-create".into(),
             channel: Some("should-not-route".into()),
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1025,6 +1027,7 @@ mod tests {
         let event = IncomingEvent {
             kind: "discord.message-create".into(),
             channel: Some("should-not-route".into()),
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1073,6 +1076,7 @@ mod tests {
         let event = IncomingEvent {
             kind: "discord.message-create".into(),
             channel: Some("should-not-route".into()),
+            source_target: None,
             mention: None,
             format: None,
             template: None,

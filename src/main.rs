@@ -311,7 +311,7 @@ async fn real_main(cli: Cli) -> Result<()> {
                         | ledger::LaneStatus::ExternallyWatched => ledger::SessionState::Healthy,
                         ledger::LaneStatus::LostMonitoring => ledger::SessionState::LostMonitoring,
                         ledger::LaneStatus::IgnoredInfra => ledger::SessionState::IgnoredAlive,
-                        ledger::LaneStatus::DeadSession => ledger::SessionState::Dead,
+                        ledger::LaneStatus::TmuxMissing => ledger::SessionState::Dead,
                         ledger::LaneStatus::UnknownTmux | ledger::LaneStatus::InfraCandidate => {
                             ledger::SessionState::Unknown
                         }
@@ -362,6 +362,96 @@ async fn real_main(cli: Cli) -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&session)?);
                 } else {
                     println!("Ignored lane {}", session.tmux_session);
+                }
+                Ok(())
+            }
+            LaneCommands::Complete(args) => {
+                let ledger = ledger::Ledger::open_default()?;
+                let session = ledger.complete_session(&args.session)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&session)?);
+                } else {
+                    println!("Completed lane {}", session.tmux_session);
+                }
+                Ok(())
+            }
+            LaneCommands::NeedsReview(args) => {
+                let ledger = ledger::Ledger::open_default()?;
+                let session = ledger.mark_needs_review(&args.session)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&session)?);
+                } else {
+                    println!("Lane {} needs review", session.tmux_session);
+                }
+                Ok(())
+            }
+            LaneCommands::NeedsQa(args) => {
+                let ledger = ledger::Ledger::open_default()?;
+                let session = ledger.mark_needs_qa(&args.session)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&session)?);
+                } else {
+                    println!("Lane {} needs QA", session.tmux_session);
+                }
+                Ok(())
+            }
+            LaneCommands::PrOpen(args) => {
+                let ledger = ledger::Ledger::open_default()?;
+                let session = ledger.mark_pr_open(&args.session)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&session)?);
+                } else {
+                    println!("Lane {} has an open PR", session.tmux_session);
+                }
+                Ok(())
+            }
+            LaneCommands::AwaitingCi(args) => {
+                let ledger = ledger::Ledger::open_default()?;
+                let session = ledger.mark_awaiting_ci(&args.session)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&session)?);
+                } else {
+                    println!("Lane {} is awaiting CI", session.tmux_session);
+                }
+                Ok(())
+            }
+            LaneCommands::AwaitingHuman(args) => {
+                let ledger = ledger::Ledger::open_default()?;
+                let session = ledger.mark_awaiting_human(&args.session)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&session)?);
+                } else {
+                    println!("Lane {} is awaiting human input", session.tmux_session);
+                }
+                Ok(())
+            }
+            LaneCommands::Cancel(args) => {
+                let ledger = ledger::Ledger::open_default()?;
+                let session = ledger.cancel_session(&args.session)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&session)?);
+                } else {
+                    println!("Cancelled lane {}", session.tmux_session);
+                }
+                Ok(())
+            }
+            LaneCommands::Supersede(args) => {
+                let ledger = ledger::Ledger::open_default()?;
+                let session = ledger.supersede_session(&args.session)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&session)?);
+                } else {
+                    println!("Superseded lane {}", session.tmux_session);
+                }
+                Ok(())
+            }
+            LaneCommands::Retire(args) => {
+                let ledger = ledger::Ledger::open_default()?;
+                let session = ledger.retire_session(&args.session)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&session)?);
+                } else {
+                    println!("Retired lane {}", session.tmux_session);
                 }
                 Ok(())
             }
@@ -755,13 +845,15 @@ fn format_lane_board(rows: &[ledger::LaneRow]) -> String {
     }
 
     let mut output =
-        "SESSION\tSTATUS\tKIND\tOWNER\tSPAWNED\tSOURCE\tLIVE_TMUX\tDAEMON_WATCH\tRESTORE\tCHANNEL\tREPO\tBRANCH\n"
+        "SESSION\tSTATUS\tWORKFLOW\tRUNTIME\tKIND\tOWNER\tSPAWNED\tSOURCE\tLIVE_TMUX\tDAEMON_WATCH\tRESTORE\tTARGET\tREPO\tBRANCH\n"
             .to_string();
     for row in rows {
         output.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             row.session,
             row.status.as_str(),
+            row.workflow_status.as_str(),
+            row.runtime_status.as_str(),
             row.kind.as_str(),
             row.owner.as_str(),
             bool_label(row.spawned_by_clawhip),
@@ -771,7 +863,7 @@ fn format_lane_board(rows: &[ledger::LaneRow]) -> String {
             bool_label(row.live_tmux),
             bool_label(row.daemon_watch),
             bool_label(row.has_restore),
-            row.channel.as_deref().unwrap_or("-"),
+            lane_target(row.channel.as_deref(), row.thread.as_deref()),
             row.repo_name.as_deref().unwrap_or("-"),
             row.branch.as_deref().unwrap_or("-"),
         ));
@@ -795,6 +887,7 @@ fn manual_session_input(session: &str, state: ledger::SessionState) -> ledger::S
         spawned_by_clawhip: false,
         expected_watch: false,
         state,
+        workflow_status: ledger::WorkflowStatus::Active,
         last_seen_at: Some(crate::source::tmux::current_timestamp_rfc3339()),
     }
 }
@@ -806,6 +899,7 @@ fn registration_from_lane_restore(
     RegisteredTmuxSession {
         session: session.tmux_session.clone(),
         channel: intent.channel.clone(),
+        thread: intent.thread.clone(),
         mention: intent.mention.clone(),
         routing: RoutingMetadata {
             repo_name: session.repo_name.clone(),
@@ -831,7 +925,7 @@ fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> S
     }
 
     let mut output =
-        "SESSION\tCHANNEL\tKEYWORDS\tMENTION\tSTALE_MINUTES\tSOURCE\tREGISTERED_AT\tPARENT\n"
+        "SESSION\tTARGET\tKEYWORDS\tMENTION\tSTALE_MINUTES\tSOURCE\tREGISTERED_AT\tPARENT\n"
             .to_string();
     for registration in registrations {
         let keywords = if registration.keywords.is_empty() {
@@ -851,7 +945,10 @@ fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> S
         output.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             registration.session,
-            registration.channel.as_deref().unwrap_or("-"),
+            lane_target(
+                registration.channel.as_deref(),
+                registration.thread.as_deref()
+            ),
             keywords,
             registration.mention.as_deref().unwrap_or("-"),
             registration.stale_minutes,
@@ -864,11 +961,24 @@ fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> S
     output
 }
 
+fn lane_target(channel: Option<&str>, thread: Option<&str>) -> String {
+    if let Some(thread) = thread.map(str::trim).filter(|value| !value.is_empty()) {
+        return format!("thread:{thread}");
+    }
+    channel
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|channel| format!("channel:{channel}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{format_lane_board, format_tmux_list, parse_expect_name_overrides};
     use crate::events::RoutingMetadata;
-    use crate::ledger::{LaneRow, LaneStatus, SessionKind, SessionOwner, SessionState};
+    use crate::ledger::{
+        LaneRow, LaneStatus, RuntimeStatus, SessionKind, SessionOwner, SessionState, WorkflowStatus,
+    };
     use crate::source::tmux::{ParentProcessInfo, RegisteredTmuxSession, RegistrationSource};
 
     #[test]
@@ -959,6 +1069,7 @@ mod tests {
         let output = format_tmux_list(&[RegisteredTmuxSession {
             session: "issue-105".into(),
             channel: Some("alerts".into()),
+            thread: None,
             mention: Some("<@123>".into()),
             routing: RoutingMetadata::default(),
             keywords: vec!["error".into(), "complete".into()],
@@ -975,10 +1086,10 @@ mod tests {
         }]);
 
         assert!(output.contains(
-            "SESSION\tCHANNEL\tKEYWORDS\tMENTION\tSTALE_MINUTES\tSOURCE\tREGISTERED_AT\tPARENT"
+            "SESSION\tTARGET\tKEYWORDS\tMENTION\tSTALE_MINUTES\tSOURCE\tREGISTERED_AT\tPARENT"
         ));
         assert!(output.contains(
-            "issue-105\talerts\terror,complete\t<@123>\t10\tcli-watch\t2026-04-02T00:00:00Z\t4242:codex"
+            "issue-105\tchannel:alerts\terror,complete\t<@123>\t10\tcli-watch\t2026-04-02T00:00:00Z\t4242:codex"
         ));
     }
 
@@ -992,6 +1103,8 @@ mod tests {
         let output = format_lane_board(&[LaneRow {
             session: "agent-1".into(),
             status: LaneStatus::LostMonitoring,
+            workflow_status: WorkflowStatus::Active,
+            runtime_status: RuntimeStatus::Live,
             kind: SessionKind::Agent,
             owner: SessionOwner::Walter,
             state: SessionState::LostMonitoring,
@@ -1002,16 +1115,17 @@ mod tests {
             daemon_watch: false,
             has_restore: true,
             channel: Some("alerts".into()),
+            thread: None,
             repo_name: Some("forever-agent".into()),
             branch: Some("main".into()),
             restore_command: Some("clawhip tmux watch --session agent-1".into()),
         }]);
 
         assert!(output.contains(
-            "SESSION\tSTATUS\tKIND\tOWNER\tSPAWNED\tSOURCE\tLIVE_TMUX\tDAEMON_WATCH\tRESTORE\tCHANNEL\tREPO\tBRANCH"
+            "SESSION\tSTATUS\tWORKFLOW\tRUNTIME\tKIND\tOWNER\tSPAWNED\tSOURCE\tLIVE_TMUX\tDAEMON_WATCH\tRESTORE\tTARGET\tREPO\tBRANCH"
         ));
         assert!(output.contains(
-            "agent-1\tlost-monitoring\tagent\twalter\tyes\tcli-new\tyes\tno\tyes\talerts\tforever-agent\tmain"
+            "agent-1\tlost-monitoring\tactive\tlive\tagent\twalter\tyes\tcli-new\tyes\tno\tyes\tchannel:alerts\tforever-agent\tmain"
         ));
     }
 }

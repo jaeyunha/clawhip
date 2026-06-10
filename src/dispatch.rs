@@ -836,6 +836,7 @@ impl GitHubCiBatcher {
         Some(IncomingEvent {
             kind: kind.to_string(),
             channel: batch.channel,
+            source_target: None,
             mention: batch.mention,
             format: batch.format,
             template: None,
@@ -979,6 +980,7 @@ mod tests {
         IncomingEvent {
             kind: kind.into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,

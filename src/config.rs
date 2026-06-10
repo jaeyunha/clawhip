@@ -237,6 +237,8 @@ pub struct MonitorConfig {
     pub github_token: Option<String>,
     #[serde(default = "default_github_api_base")]
     pub github_api_base: String,
+    #[serde(default = "default_github_direct_workflow_run_max_age_secs")]
+    pub github_direct_workflow_run_max_age_secs: u64,
     #[serde(default)]
     pub git: GitMonitorConfig,
     #[serde(default)]
@@ -251,6 +253,8 @@ impl Default for MonitorConfig {
             poll_interval_secs: default_poll_interval(),
             github_token: None,
             github_api_base: default_github_api_base(),
+            github_direct_workflow_run_max_age_secs:
+                default_github_direct_workflow_run_max_age_secs(),
             git: GitMonitorConfig::default(),
             tmux: TmuxMonitorConfig::default(),
             workspace: Vec::new(),
@@ -536,6 +540,9 @@ fn default_poll_interval() -> u64 {
 }
 fn default_github_api_base() -> String {
     "https://api.github.com".to_string()
+}
+fn default_github_direct_workflow_run_max_age_secs() -> u64 {
+    600
 }
 fn default_remote() -> String {
     "origin".to_string()
@@ -1986,6 +1993,22 @@ thread = "123456789012345678"
         let config = AppConfig::load_or_default(&path).unwrap();
 
         assert_eq!(config.dispatch.ci_batch_window_secs, 90);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn load_or_default_parses_github_direct_workflow_run_max_age_secs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[providers.discord]\ntoken = \"abc\"\n[monitors]\ngithub_direct_workflow_run_max_age_secs = 300\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(config.monitors.github_direct_workflow_run_max_age_secs, 300);
         assert!(config.validate().is_ok());
     }
 

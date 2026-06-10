@@ -281,6 +281,7 @@ pub struct VerifyGatewayAllowlistArgs {
 impl EmitArgs {
     pub fn into_event(self) -> crate::Result<crate::events::IncomingEvent> {
         let mut channel = None;
+        let mut source_target = None;
         let mut mention = None;
         let mut format = None;
         let mut template = None;
@@ -295,10 +296,12 @@ impl EmitArgs {
             let key = pair[0]
                 .strip_prefix("--")
                 .ok_or_else(|| format!("emit field names must start with --, got {}", pair[0]))?;
-            let key = normalize_emit_key(key);
+            let normalized_key = key.replace('-', "_");
+            let key = normalize_emit_key(&normalized_key);
             let raw_value = pair[1].clone();
             match key {
                 "channel" => channel = Some(raw_value),
+                "source_target" => source_target = Some(parse_event_target_hint(&raw_value)?),
                 "mention" => mention = Some(raw_value),
                 "format" => format = Some(MessageFormat::from_label(&raw_value)?),
                 "template" => template = Some(raw_value),
@@ -321,12 +324,39 @@ impl EmitArgs {
         Ok(crate::events::IncomingEvent {
             kind: self.event_type,
             channel,
+            source_target,
             mention,
             format,
             template,
             payload,
         })
     }
+}
+
+fn parse_event_target_hint(raw: &str) -> crate::Result<crate::events::EventTargetHint> {
+    if let Some(id) = raw.strip_prefix("discord-thread:") {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("source_target discord-thread id cannot be empty".into());
+        }
+        return Ok(crate::events::EventTargetHint::DiscordThread(
+            id.to_string(),
+        ));
+    }
+    if let Some(id) = raw.strip_prefix("discord-channel:") {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("source_target discord-channel id cannot be empty".into());
+        }
+        return Ok(crate::events::EventTargetHint::DiscordChannel(
+            id.to_string(),
+        ));
+    }
+
+    let parsed = serde_json::from_str::<crate::events::EventTargetHint>(raw).map_err(|_| {
+        "source_target must be discord-thread:<id>, discord-channel:<id>, or JSON {\"kind\":\"discord-thread\",\"id\":\"...\"}"
+    })?;
+    Ok(parsed)
 }
 
 fn normalize_emit_key(key: &str) -> &str {
@@ -581,6 +611,24 @@ pub enum LaneCommands {
     Reconcile(LaneBoardArgs),
     /// Mark a live infrastructure/manual session as intentionally unwatched.
     Ignore(LaneSessionArgs),
+    /// Mark a lane as completed and remove it from active board debt.
+    Complete(LaneSessionArgs),
+    /// Mark a lane as ready for code review.
+    NeedsReview(LaneSessionArgs),
+    /// Mark a lane as ready for QA/proof.
+    NeedsQa(LaneSessionArgs),
+    /// Mark a lane as having an open PR.
+    PrOpen(LaneSessionArgs),
+    /// Mark a lane as waiting for CI/checks.
+    AwaitingCi(LaneSessionArgs),
+    /// Mark a lane as waiting on a human decision.
+    AwaitingHuman(LaneSessionArgs),
+    /// Mark a lane as cancelled and remove it from active board debt.
+    Cancel(LaneSessionArgs),
+    /// Mark a lane as superseded by another lane or workflow.
+    Supersede(LaneSessionArgs),
+    /// Retire a completed/stale ledger lane so it no longer appears as active debt.
+    Retire(LaneSessionArgs),
     /// Print the saved watch command for a session.
     Restore(LaneRestoreArgs),
     /// Show clawhip registrations, tmux panes, and worktree hygiene in one inspector.
@@ -678,6 +726,8 @@ pub struct TmuxNewArgs {
     #[arg(long)]
     pub channel: Option<String>,
     #[arg(long)]
+    pub thread: Option<String>,
+    #[arg(long)]
     pub mention: Option<String>,
     #[arg(long, value_delimiter = ',')]
     pub keywords: Vec<String>,
@@ -710,6 +760,8 @@ pub struct TmuxWatchArgs {
     pub session: String,
     #[arg(long)]
     pub channel: Option<String>,
+    #[arg(long)]
+    pub thread: Option<String>,
     #[arg(long)]
     pub mention: Option<String>,
     #[arg(long, value_delimiter = ',')]
@@ -896,6 +948,35 @@ mod tests {
         assert_eq!(event.template.as_deref(), Some("agent {agent_name}"));
         assert_eq!(event.payload["agent_name"], Value::String("omc".into()));
         assert_eq!(event.payload["elapsed_secs"], Value::from(17));
+    }
+
+    #[test]
+    fn parses_emit_subcommand_with_source_target() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "emit",
+            "session.started",
+            "--source-target",
+            "discord-thread:thread-123",
+            "--session",
+            "forever-agent-123",
+        ]);
+
+        let Commands::Emit(args) = cli.command.expect("emit command") else {
+            panic!("expected emit command");
+        };
+
+        let event = args.into_event().expect("event");
+        assert_eq!(
+            event.source_target,
+            Some(crate::events::EventTargetHint::DiscordThread(
+                "thread-123".into()
+            ))
+        );
+        assert_eq!(
+            event.payload["session_id"],
+            Value::String("forever-agent-123".into())
+        );
     }
 
     #[test]
@@ -1135,6 +1216,87 @@ mod tests {
         };
         let LaneCommands::Ignore(args) = command else {
             panic!("expected lane ignore command");
+        };
+        assert_eq!(args.session, "agent-1");
+
+        let cli = Cli::parse_from(["clawhip", "lane", "complete", "--session", "agent-1"]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::Complete(args) = command else {
+            panic!("expected lane complete command");
+        };
+        assert_eq!(args.session, "agent-1");
+
+        let cli = Cli::parse_from(["clawhip", "lane", "needs-review", "--session", "agent-1"]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::NeedsReview(args) = command else {
+            panic!("expected lane needs-review command");
+        };
+        assert_eq!(args.session, "agent-1");
+
+        let cli = Cli::parse_from(["clawhip", "lane", "needs-qa", "--session", "agent-1"]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::NeedsQa(args) = command else {
+            panic!("expected lane needs-qa command");
+        };
+        assert_eq!(args.session, "agent-1");
+
+        let cli = Cli::parse_from(["clawhip", "lane", "pr-open", "--session", "agent-1"]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::PrOpen(args) = command else {
+            panic!("expected lane pr-open command");
+        };
+        assert_eq!(args.session, "agent-1");
+
+        let cli = Cli::parse_from(["clawhip", "lane", "awaiting-ci", "--session", "agent-1"]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::AwaitingCi(args) = command else {
+            panic!("expected lane awaiting-ci command");
+        };
+        assert_eq!(args.session, "agent-1");
+
+        let cli = Cli::parse_from(["clawhip", "lane", "awaiting-human", "--session", "agent-1"]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::AwaitingHuman(args) = command else {
+            panic!("expected lane awaiting-human command");
+        };
+        assert_eq!(args.session, "agent-1");
+
+        let cli = Cli::parse_from(["clawhip", "lane", "cancel", "--session", "agent-1"]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::Cancel(args) = command else {
+            panic!("expected lane cancel command");
+        };
+        assert_eq!(args.session, "agent-1");
+
+        let cli = Cli::parse_from(["clawhip", "lane", "supersede", "--session", "agent-1"]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::Supersede(args) = command else {
+            panic!("expected lane supersede command");
+        };
+        assert_eq!(args.session, "agent-1");
+
+        let cli = Cli::parse_from(["clawhip", "lane", "retire", "--session", "agent-1"]);
+        let Commands::Lane { command } = cli.command.expect("lane command") else {
+            panic!("expected lane command");
+        };
+        let LaneCommands::Retire(args) = command else {
+            panic!("expected lane retire command");
         };
         assert_eq!(args.session, "agent-1");
 

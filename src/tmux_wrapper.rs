@@ -17,6 +17,7 @@ use crate::source::tmux::{
 };
 
 pub async fn run(args: TmuxNewArgs, config: &AppConfig) -> Result<()> {
+    validate_monitor_target(args.channel.as_deref(), args.thread.as_deref())?;
     launch_session(&args).await?;
     let monitor_args = TmuxMonitorArgs::from_new_args(&args, config);
 
@@ -36,6 +37,7 @@ pub async fn run(args: TmuxNewArgs, config: &AppConfig) -> Result<()> {
 }
 
 pub async fn watch(args: TmuxWatchArgs, config: &AppConfig) -> Result<()> {
+    validate_monitor_target(args.channel.as_deref(), args.thread.as_deref())?;
     if !session_exists(&args.session).await? {
         return Err(format!("tmux session '{}' does not exist", args.session).into());
     }
@@ -49,6 +51,7 @@ pub async fn watch(args: TmuxWatchArgs, config: &AppConfig) -> Result<()> {
 struct TmuxMonitorArgs {
     session: String,
     channel: Option<String>,
+    thread: Option<String>,
     mention: Option<String>,
     routing: RoutingMetadata,
     keywords: Vec<String>,
@@ -65,6 +68,7 @@ impl From<&TmuxNewArgs> for TmuxMonitorArgs {
         Self {
             session: value.session.clone(),
             channel: value.channel.clone(),
+            thread: value.thread.clone(),
             mention: value.mention.clone(),
             routing: routing_metadata_for_cwd(value.cwd.as_deref()),
             keywords: value.keywords.clone(),
@@ -81,7 +85,7 @@ impl From<&TmuxNewArgs> for TmuxMonitorArgs {
 impl TmuxMonitorArgs {
     fn from_new_args(value: &TmuxNewArgs, config: &AppConfig) -> Self {
         let mut monitor_args = Self::from(value);
-        if monitor_args.channel.is_none() {
+        if monitor_args.channel.is_none() && monitor_args.thread.is_none() {
             monitor_args.channel = resolve_tmux_session_channel_with_metadata(
                 config,
                 &value.session,
@@ -97,6 +101,7 @@ impl From<&TmuxWatchArgs> for TmuxMonitorArgs {
         Self {
             session: value.session.clone(),
             channel: value.channel.clone(),
+            thread: value.thread.clone(),
             mention: value.mention.clone(),
             routing: routing_metadata_for_session(&value.session),
             keywords: value.keywords.clone(),
@@ -115,6 +120,7 @@ impl TmuxMonitorArgs {
         RegisteredTmuxSession {
             session: self.session,
             channel: self.channel,
+            thread: self.thread,
             mention: self.mention,
             routing: self.routing,
             keywords: self.keywords,
@@ -127,6 +133,15 @@ impl TmuxMonitorArgs {
             active_wrapper_monitor,
         }
     }
+}
+
+fn validate_monitor_target(channel: Option<&str>, thread: Option<&str>) -> Result<()> {
+    if channel.is_some_and(|value| !value.trim().is_empty())
+        && thread.is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err("use only one of --channel or --thread for a tmux watch target".into());
+    }
+    Ok(())
 }
 
 fn routing_metadata_for_cwd(cwd: Option<&str>) -> RoutingMetadata {
@@ -526,6 +541,7 @@ mod tests {
             window_name: None,
             cwd: None,
             channel: None,
+            thread: None,
             mention: None,
             keywords: Vec::new(),
             stale_minutes: 10,
@@ -556,6 +572,7 @@ mod tests {
             window_name: None,
             cwd: None,
             channel: None,
+            thread: None,
             mention: None,
             keywords: Vec::new(),
             stale_minutes: 10,
@@ -582,6 +599,7 @@ mod tests {
             window_name: None,
             cwd: None,
             channel: None,
+            thread: None,
             mention: None,
             keywords: Vec::new(),
             stale_minutes: 10,
@@ -606,6 +624,7 @@ mod tests {
         let args = TmuxWatchArgs {
             session: "existing".into(),
             channel: Some("alerts".into()),
+            thread: None,
             mention: Some("<@123>".into()),
             keywords: vec!["error".into(), "complete".into()],
             stale_minutes: 15,
@@ -637,6 +656,7 @@ mod tests {
         let registration = TmuxMonitorArgs {
             session: "issue-105".into(),
             channel: Some("alerts".into()),
+            thread: None,
             mention: None,
             routing: RoutingMetadata::default(),
             keywords: vec!["error".into()],
@@ -674,6 +694,7 @@ mod tests {
         let registration = TmuxMonitorArgs {
             session: "issue-194".into(),
             channel: Some("alerts".into()),
+            thread: None,
             mention: None,
             routing: RoutingMetadata::default(),
             keywords: vec!["error".into()],
@@ -699,6 +720,7 @@ mod tests {
         let log = format_watch_audit_log(&RegisteredTmuxSession {
             session: "issue-105".into(),
             channel: Some("alerts".into()),
+            thread: None,
             mention: Some("<@123>".into()),
             routing: RoutingMetadata::default(),
             keywords: vec!["error".into(), "complete".into()],
@@ -732,6 +754,7 @@ mod tests {
             window_name: None,
             cwd: None,
             channel: None,
+            thread: None,
             mention: None,
             keywords: Vec::new(),
             stale_minutes: 10,
@@ -781,6 +804,7 @@ mod tests {
             window_name: None,
             cwd: Some(repo.path().to_string_lossy().into_owned()),
             channel: None,
+            thread: None,
             mention: None,
             keywords: Vec::new(),
             stale_minutes: 10,
@@ -845,6 +869,7 @@ mod tests {
             window_name: None,
             cwd: None,
             channel: Some("manual".into()),
+            thread: None,
             mention: None,
             keywords: Vec::new(),
             stale_minutes: 10,

@@ -296,6 +296,9 @@ default_channel = "your-default-channel-id"
 [dispatch]
 routine_batch_window_secs = 5
 ci_batch_window_secs = 300
+
+[monitors]
+github_direct_workflow_run_max_age_secs = 600
 ```
 
 Legacy `[discord]` config is still accepted and normalized at load time.
@@ -303,6 +306,8 @@ Legacy `[discord]` config is still accepted and normalized at load time.
 `[dispatch].routine_batch_window_secs` controls the default Discord-only routine burst batch window. Leave it unset to keep the 5-second default, or set it to `0` to disable routine batching entirely. In v1, grouped routine bursts suppress route/event mentions for 2+ items, while explicit failure/stale/CI paths still bypass the routine batcher.
 
 `[dispatch].ci_batch_window_secs` controls how long clawhip waits before flushing a GitHub CI batch summary. Leave it unset to keep the 30-second default, or increase it for longer workflows that finish jobs over several minutes.
+
+`[monitors].github_direct_workflow_run_max_age_secs` controls the live window for direct push workflow runs fetched from GitHub Actions. Completed direct workflow runs older than this window are treated as historical backlog and suppressed; in-progress runs and PR check-runs are still tracked. Set it to `0` to disable the age guard.
 
 ## Discord webhook setup
 
@@ -594,6 +599,7 @@ clawhip tmux list
 Fallback/debug input:
 ```bash
 clawhip tmux new -s <session> \
+  --thread <discord-thread-id> \
   --mention '<@id>' \
   --keywords 'error,PR created,FAILED,complete' \
   --stale-minutes 10 \
@@ -605,6 +611,7 @@ clawhip tmux new -s <session> \
   -- command args
 
 clawhip tmux watch -s <existing-session> \
+  --thread <discord-thread-id> \
   --mention '<@id>' \
   --keywords 'error,PR created,FAILED,complete' \
   --stale-minutes 10 \
@@ -624,6 +631,15 @@ clawhip lane reconcile
 clawhip lane restore --session <session>
 clawhip lane restore --session <session> --apply
 clawhip lane ignore --session <manual-dev-server-session>
+clawhip lane needs-review --session <session-ready-for-review>
+clawhip lane needs-qa --session <session-ready-for-qa>
+clawhip lane pr-open --session <session-with-open-pr>
+clawhip lane awaiting-ci --session <session-waiting-for-checks>
+clawhip lane awaiting-human --session <session-waiting-for-human>
+clawhip lane complete --session <merged-or-verified-session>
+clawhip lane cancel --session <human-stopped-session>
+clawhip lane supersede --session <session-with-confirmed-replacement-owner>
+clawhip lane retire --session <old-ambiguous-or-archived-session>
 clawhip lane inspect
 ```
 
@@ -631,12 +647,25 @@ Behavior:
 - Codex and Claude should own session launch and hook registration
 - `clawhip native hook` is the local thin-client ingress for provider payloads
 - `tmux new` / `tmux watch` are fallback paths for debugging or manual recovery
+- `tmux new` / `tmux watch` accept exactly one explicit Discord target: `--channel <id>` or `--thread <id>`; omit both to auto-resolve the project channel from routes
+- thread-backed tmux watches carry that target onto correlated lane events, so `tmux.*` and matching `session.*` lifecycle events route to the task thread while project-wide GitHub events continue using project routes
 - `deliver` is the prompt recovery path for an already-running hooked tmux-backed provider session
-- `tmux list` shows active daemon-known watches with source, registration timestamp, and parent-process info
+- `tmux list` shows active daemon-known watches with target, source, registration timestamp, and parent-process info
 - `lane board` shows durable ledger state against live tmux and daemon watches; `SPAWNED=yes` / `SOURCE=cli-new` means clawhip spawned the lane
+- `lane board` separates `WORKFLOW` (`active`, `needs-review`, `needs-qa`, `pr-open`, `awaiting-ci`, `awaiting-human`, `completed`, `superseded`, `cancelled`, `retired`) from `RUNTIME` (`live` or `tmux-missing`)
 - `lane reconcile` is strict and mutates ledger state only when tmux and daemon inventory are both available
 - `lane restore --apply` re-registers a saved watch intent after daemon monitoring is lost
 - `lane ignore` is for live manual/dev-server tmux sessions; it refuses clawhip-managed agent lanes
+- `lane needs-review` marks a lane ready for Walter/Hermes code review
+- `lane needs-qa` marks a lane ready for QA/proof
+- `lane pr-open` marks a lane that produced an open PR
+- `lane awaiting-ci` marks a lane waiting on checks
+- `lane awaiting-human` marks a lane blocked on a human decision
+- `lane complete` marks a verified/merged lane as `completed` so it no longer appears as active board debt
+- `lane cancel` marks a human-stopped lane as `cancelled`
+- `lane supersede` marks a lane as `superseded` only when a confirmed replacement lane/workflow already owns the same task
+- `lane retire` is an archive fallback for old ambiguous/stale rows; prefer the more specific terminal command when the outcome is known
+- `tmux-missing` means the ledger remembers the lane but tmux no longer has that session; it is a runtime fact, not proof that the work finished or failed. If the workflow is still active/phase-like, inspect evidence and restore or respawn unless a terminal outcome is known
 - `lane inspect` is an ad hoc tmux/worktree inspector and does not replace the durable `lane board`
 - forever-agent dev servers launched by `bun run dev:all` use `ever-<worktree-basename>` tmux sessions; these appear as `infra-candidate` until ignored, and can be attached with `tmux attach -t ever-<worktree-basename>`
 - final delivery still goes through daemon routing
@@ -765,6 +794,14 @@ Discord thread targets:
 - Use `thread = "DISCORD_THREAD_ID"` on a Discord route to deliver directly into
   a thread. This is explicit; clawhip does not infer threads from `channel` IDs,
   names, session labels, or payload fields.
+- Use `clawhip tmux new --thread DISCORD_THREAD_ID` or
+  `clawhip tmux watch --thread DISCORD_THREAD_ID` for dynamic per-lane task
+  threads. This target is stored in the lane ledger and restored by
+  `clawhip lane restore`; it does not require writing dynamic `[[routes]]`
+  entries into `config.toml`.
+- For Discord routes, a correlated event source target wins over a matching
+  route channel, so broad project `tmux.*` / `session.*` routes can still supply
+  mention and format without stealing task-thread delivery.
 - A Discord route may set exactly one delivery target: `channel`, `thread`, or
   `webhook`.
 - Thread delivery uses the configured thread ID as the Discord message target.

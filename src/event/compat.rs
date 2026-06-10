@@ -558,6 +558,7 @@ mod tests {
         let event = IncomingEvent {
             kind: "plugin.custom".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -674,6 +675,7 @@ mod tests {
             let event = IncomingEvent {
                 kind: kind.into(),
                 channel: None,
+                source_target: None,
                 mention: None,
                 format: None,
                 template: None,
@@ -690,6 +692,7 @@ mod tests {
         let event = IncomingEvent {
             kind: "agent.finished".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,

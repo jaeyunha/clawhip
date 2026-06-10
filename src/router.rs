@@ -5,7 +5,7 @@ use serde_json::json;
 use crate::Result;
 use crate::config::{AppConfig, RouteRule, default_sink_name};
 use crate::dynamic_tokens;
-use crate::events::{IncomingEvent, MessageFormat, RoutingMetadata};
+use crate::events::{EventTargetHint, IncomingEvent, MessageFormat, RoutingMetadata};
 use crate::provenance::{DeliveryExplanation, FilterResult, Provenance, RouteExplanation};
 #[cfg(test)]
 use crate::render::DefaultRenderer;
@@ -360,6 +360,17 @@ impl Router {
                     return Ok(SinkTarget::DiscordChannel(channel));
                 }
 
+                if let Some(source_target) = &event.source_target {
+                    return match source_target {
+                        EventTargetHint::DiscordChannel(channel) => {
+                            Ok(SinkTarget::DiscordChannel(channel.clone()))
+                        }
+                        EventTargetHint::DiscordThread(thread) => {
+                            Ok(SinkTarget::DiscordThread(thread.clone()))
+                        }
+                    };
+                }
+
                 if let Some(thread) = route.and_then(RouteRule::discord_thread_target) {
                     return Ok(SinkTarget::DiscordThread(thread.to_string()));
                 }
@@ -426,6 +437,7 @@ pub(crate) fn resolve_tmux_session_channel_with_metadata(
     let session_context = IncomingEvent {
         kind: "session.started".to_string(),
         channel: None,
+        source_target: None,
         mention: None,
         format: None,
         template: None,
@@ -674,7 +686,7 @@ pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::{DefaultsConfig, RouteRule};
-    use crate::events::{RoutingMetadata, normalize_event};
+    use crate::events::{EventTargetHint, RoutingMetadata, normalize_event};
     use crate::render::DefaultRenderer;
     use crate::sink::{DiscordSink, SlackSink};
     use serde_json::json;
@@ -775,6 +787,49 @@ mod tests {
             SinkTarget::LocalFile("/tmp/clawhip/events.jsonl".into())
         );
         assert_eq!(delivery.trace.result, RouteTraceResult::Matched);
+    }
+
+    #[tokio::test]
+    async fn source_thread_target_overrides_matching_route_channel() {
+        let config = AppConfig {
+            routes: vec![RouteRule {
+                event: "tmux.*".into(),
+                sink: "discord".into(),
+                filter: BTreeMap::from([("repo_name".into(), "forever-agent".into())]),
+                channel: Some("project-channel".into()),
+                thread: None,
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                local_path: None,
+                mention: Some("<@walter>".into()),
+                allow_dynamic_tokens: false,
+                format: Some(MessageFormat::Alert),
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::tmux_keyword(
+            "forever-agent-123".into(),
+            "NARROW_DONE".into(),
+            "done".into(),
+            None,
+        )
+        .with_routing_metadata(&RoutingMetadata {
+            repo_name: Some("forever-agent".into()),
+            ..RoutingMetadata::default()
+        })
+        .with_source_target(Some(EventTargetHint::DiscordThread("task-thread".into())));
+
+        let delivery = router.preview_delivery(&event).await.unwrap();
+
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordThread("task-thread".into())
+        );
+        assert_eq!(delivery.mention.as_deref(), Some("<@walter>"));
+        assert_eq!(delivery.format, MessageFormat::Alert);
     }
 
     #[tokio::test]
@@ -884,6 +939,7 @@ mod tests {
         let event = IncomingEvent {
             kind: "session.finished".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1021,6 +1077,50 @@ mod tests {
             content,
             "🚨 tmux session issue-1440 hit keyword 'error': boom"
         );
+    }
+
+    #[tokio::test]
+    async fn github_pr_comment_matches_pr_family_route() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "github.pr-*".into(),
+                sink: "discord".into(),
+                filter: [("repo_name".to_string(), "forever-agent".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("forever-channel".into()),
+                thread: None,
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                local_path: None,
+                mention: Some("<@walter>".into()),
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::github_pr_commented(
+            "forever-agent".into(),
+            298,
+            "Observability".into(),
+            7,
+            None,
+        );
+
+        let (channel, format, content) = router.preview(&event).await.unwrap();
+
+        assert_eq!(channel, "forever-channel");
+        assert_eq!(format, MessageFormat::Compact);
+        assert!(content.starts_with("<@walter> "));
+        assert!(content.contains("forever-agent#298 PR commented (7 comments): Observability"));
     }
 
     #[tokio::test]
@@ -1537,6 +1637,7 @@ mod tests {
         let event = normalize_event(IncomingEvent {
             kind: "post-tool-use".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1598,6 +1699,7 @@ mod tests {
         let event = normalize_event(IncomingEvent {
             kind: "finished".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1771,6 +1873,7 @@ mod tests {
         let session_event = IncomingEvent {
             kind: "session.started".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1869,6 +1972,7 @@ mod tests {
         let event = normalize_event(IncomingEvent {
             kind: "session.started".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -2635,6 +2739,7 @@ mod tests {
         let event = IncomingEvent {
             kind: "session.finished".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,

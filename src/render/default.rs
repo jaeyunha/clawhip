@@ -113,6 +113,26 @@ impl Renderer for DefaultRenderer {
             ("github.issue-commented", MessageFormat::Raw) => {
                 serde_json::to_string_pretty(payload)?
             }
+            ("github.pr-commented", MessageFormat::Compact) => format!(
+                "{}#{} PR commented ({} comments): {}",
+                string_field(payload, "repo")?,
+                payload.field_u64("number")?,
+                payload.field_u64("comments")?,
+                string_field(payload, "title")?
+            ),
+            ("github.pr-commented", MessageFormat::Alert) => format!(
+                "🚨 GitHub PR commented in {}: #{} {}",
+                string_field(payload, "repo")?,
+                payload.field_u64("number")?,
+                string_field(payload, "title")?
+            ),
+            ("github.pr-commented", MessageFormat::Inline) => format!(
+                "[GitHub PR comment] {}#{} {}",
+                string_field(payload, "repo")?,
+                payload.field_u64("number")?,
+                string_field(payload, "title")?
+            ),
+            ("github.pr-commented", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
             ("github.issue-closed", MessageFormat::Compact) => format!(
                 "{}#{} closed: {}",
                 string_field(payload, "repo")?,
@@ -393,8 +413,8 @@ fn agent_inline_suffix(payload: &Value) -> String {
 fn render_session_event(kind: &str, payload: &Value, format: &MessageFormat) -> Result<String> {
     let label = session_subject(payload);
     let status = session_status_label(kind, payload);
-    let detail = session_detail_suffix(payload);
-    let inline = session_inline_suffix(payload);
+    let detail = session_detail_suffix(kind, payload);
+    let inline = session_inline_suffix(kind, payload);
     let prefix = agent_optional_mention_prefix(payload);
 
     Ok(match format {
@@ -433,7 +453,7 @@ fn session_status_label(kind: &str, payload: &Value) -> String {
     }
 }
 
-fn session_detail_suffix(payload: &Value) -> String {
+fn session_detail_suffix(kind: &str, payload: &Value) -> String {
     let mut parts = Vec::new();
 
     if let Some(repo_name) = optional_string_field(payload, "repo_name")
@@ -456,7 +476,9 @@ fn session_detail_suffix(payload: &Value) -> String {
     if let Some(elapsed_secs) = optional_u64_field(payload, "elapsed_secs") {
         parts.push(format!("elapsed={elapsed_secs}s"));
     }
-    if let Some(summary) = optional_string_field(payload, "summary") {
+    if kind != "session.stopped"
+        && let Some(summary) = optional_string_field(payload, "summary")
+    {
         parts.push(format!("summary={summary}"));
     }
     if let Some(error_message) = optional_string_field(payload, "error_message") {
@@ -470,7 +492,7 @@ fn session_detail_suffix(payload: &Value) -> String {
     }
 }
 
-fn session_inline_suffix(payload: &Value) -> String {
+fn session_inline_suffix(kind: &str, payload: &Value) -> String {
     let mut parts = Vec::new();
 
     if let Some(repo_name) = optional_string_field(payload, "repo_name")
@@ -493,7 +515,9 @@ fn session_inline_suffix(payload: &Value) -> String {
     if let Some(elapsed_secs) = optional_u64_field(payload, "elapsed_secs") {
         parts.push(format!("{elapsed_secs}s"));
     }
-    if let Some(summary) = optional_string_field(payload, "summary") {
+    if kind != "session.stopped"
+        && let Some(summary) = optional_string_field(payload, "summary")
+    {
         parts.push(summary);
     }
     if let Some(error_message) = optional_string_field(payload, "error_message") {
@@ -936,6 +960,34 @@ mod tests {
         assert_eq!(
             rendered,
             "🚨 tmux session issue-220 hit keyword 'ERROR_READY': ERROR_READY (pane %3/0.1, cursor 42, fresh-output)"
+        );
+    }
+
+    #[test]
+    fn renders_session_stopped_without_prompt_summary_noise() {
+        let event = IncomingEvent::workspace(
+            "session.stopped".into(),
+            serde_json::json!({
+                "tool": "codex",
+                "session_name": "clawhip-smoke-thread-walter",
+                "repo_name": "clawhip",
+                "status": "stopped",
+                "summary": "Read-only smoke test.Run exactly these checks...",
+            }),
+            None,
+        );
+
+        assert_eq!(
+            DefaultRenderer
+                .render(&event, &MessageFormat::Compact)
+                .unwrap(),
+            "codex clawhip-smoke-thread-walter stopped (repo=clawhip)"
+        );
+        assert_eq!(
+            DefaultRenderer
+                .render(&event, &MessageFormat::Inline)
+                .unwrap(),
+            "[codex clawhip-smoke-thread-walter] stopped · clawhip"
         );
     }
 

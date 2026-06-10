@@ -544,6 +544,7 @@ mod tests {
         IncomingEvent {
             kind: kind.into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -638,6 +639,7 @@ mod tests {
         let generic = IncomingEvent {
             kind: "session.started".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,

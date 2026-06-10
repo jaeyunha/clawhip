@@ -52,6 +52,8 @@ pub struct ParentProcessInfo {
 pub struct RegisteredTmuxSession {
     pub session: String,
     pub channel: Option<String>,
+    #[serde(default)]
+    pub thread: Option<String>,
     pub mention: Option<String>,
     #[serde(default)]
     pub routing: RoutingMetadata,
@@ -76,6 +78,7 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
         Self {
             session: value.session.clone(),
             channel: value.channel.clone(),
+            thread: None,
             mention: value.mention.clone(),
             routing: RoutingMetadata::default(),
             keywords: value.keywords.clone(),
@@ -741,6 +744,7 @@ fn tmux_keyword_event(
     };
 
     event
+        .with_source_target(registration_source_target(registration))
         .with_routing_metadata(&registration.routing)
         .with_mention(registration.mention.clone())
         .with_format(registration.format.clone())
@@ -768,6 +772,7 @@ fn tmux_keyword_event_from_hit_payloads(
     IncomingEvent {
         kind: "tmux.keyword".to_string(),
         channel,
+        source_target: None,
         mention: None,
         format: None,
         template: None,
@@ -816,9 +821,25 @@ fn tmux_stale_event(
         last_line,
         registration.channel.clone(),
     )
+    .with_source_target(registration_source_target(registration))
     .with_routing_metadata(&registration.routing)
     .with_mention(registration.mention.clone())
     .with_format(registration.format.clone())
+}
+
+fn registration_source_target(
+    registration: &RegisteredTmuxSession,
+) -> Option<crate::events::EventTargetHint> {
+    registration
+        .thread
+        .as_ref()
+        .map(|thread| crate::events::EventTargetHint::DiscordThread(thread.clone()))
+        .or_else(|| {
+            registration
+                .channel
+                .as_ref()
+                .map(|channel| crate::events::EventTargetHint::DiscordChannel(channel.clone()))
+        })
 }
 
 async fn flush_pending_keyword_hits<E: EventEmitter>(
@@ -1025,6 +1046,7 @@ mod tests {
         RegisteredTmuxSession {
             session: "issue-24".into(),
             channel: Some("alerts".into()),
+            thread: None,
             mention: Some("<@123>".into()),
             routing: RoutingMetadata::default(),
             keywords: keywords.into_iter().map(str::to_string).collect(),
@@ -1080,6 +1102,25 @@ PR created #7",
         assert_eq!(event.payload["keyword"], "error");
         assert_eq!(event.payload["line"], "boom");
         assert_eq!(event.payload["hit_count"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn tmux_keyword_event_uses_registered_thread_as_source_target() {
+        let mut registration = registration(vec!["error"]);
+        registration.thread = Some("task-thread".into());
+
+        let event = tmux_keyword_event(
+            &registration,
+            "issue-24".into(),
+            vec![keyword_hit("error", "boom")],
+        );
+
+        assert_eq!(
+            event.source_target,
+            Some(crate::events::EventTargetHint::DiscordThread(
+                "task-thread".into()
+            ))
+        );
     }
 
     #[test]
@@ -1206,6 +1247,7 @@ PR created #7",
                 RegisteredTmuxSession {
                     session: "issue-105".into(),
                     channel: Some("alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["error".into()],
@@ -1223,6 +1265,7 @@ PR created #7",
                 RegisteredTmuxSession {
                     session: "wrapper".into(),
                     channel: Some("alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["panic".into()],
@@ -1243,6 +1286,7 @@ PR created #7",
                 RegisteredTmuxSession {
                     session: "stale-config".into(),
                     channel: Some("alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["panic".into()],
@@ -1264,6 +1308,7 @@ PR created #7",
                 RegisteredTmuxSession {
                     session: "issue-105".into(),
                     channel: Some("alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["error".into(), "complete".into()],
@@ -1292,6 +1337,7 @@ PR created #7",
             RegisteredTmuxSession {
                 session: "issue-226".into(),
                 channel: Some("wrapper-alerts".into()),
+                thread: None,
                 mention: None,
                 routing: RoutingMetadata::default(),
                 keywords: vec!["wrapper-keyword".into()],
@@ -1315,6 +1361,7 @@ PR created #7",
                 RegisteredTmuxSession {
                     session: "issue-226".into(),
                     channel: Some("config-alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["config-keyword".into()],
@@ -1636,6 +1683,7 @@ error: failed";
             vec![RegisteredTmuxSession {
                 session: "rcc-*".into(),
                 channel: Some("alerts".into()),
+                thread: None,
                 mention: None,
                 routing: RoutingMetadata::default(),
                 keywords: vec!["panic".into()],
@@ -1666,6 +1714,7 @@ error: failed";
                 RegisteredTmuxSession {
                     session: "rcc-*".into(),
                     channel: Some("rcc-alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["panic".into()],
@@ -1680,6 +1729,7 @@ error: failed";
                 RegisteredTmuxSession {
                     session: "omx-*".into(),
                     channel: Some("omx-alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["error".into()],
@@ -1708,6 +1758,7 @@ error: failed";
                 RegisteredTmuxSession {
                     session: "exact-session".into(),
                     channel: Some("alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["panic".into()],
@@ -1722,6 +1773,7 @@ error: failed";
                 RegisteredTmuxSession {
                     session: "rcc-*".into(),
                     channel: Some("alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["panic".into()],
@@ -1749,6 +1801,7 @@ error: failed";
                 RegisteredTmuxSession {
                     session: "*".into(),
                     channel: Some("default-alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["error".into()],
@@ -1763,6 +1816,7 @@ error: failed";
                 RegisteredTmuxSession {
                     session: "rcc-api".into(),
                     channel: Some("rcc-alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["panic".into()],
@@ -1790,6 +1844,7 @@ error: failed";
                 RegisteredTmuxSession {
                     session: "*".into(),
                     channel: Some("default-alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["error".into()],
@@ -1804,6 +1859,7 @@ error: failed";
                 RegisteredTmuxSession {
                     session: "rcc-*".into(),
                     channel: Some("rcc-alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["panic".into()],
@@ -1836,6 +1892,7 @@ error: failed";
                 RegisteredTmuxSession {
                     session: "*abc*".into(),
                     channel: Some("broad-alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["error".into()],
@@ -1850,6 +1907,7 @@ error: failed";
                 RegisteredTmuxSession {
                     session: "abc*".into(),
                     channel: Some("specific-alerts".into()),
+                    thread: None,
                     mention: None,
                     routing: RoutingMetadata::default(),
                     keywords: vec!["panic".into()],

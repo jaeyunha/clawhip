@@ -19,7 +19,7 @@ use crate::config::AppConfig;
 use crate::cron::CronSource;
 use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
-use crate::events::{IncomingEvent, MessageFormat, normalize_event};
+use crate::events::{EventTargetHint, IncomingEvent, MessageFormat, normalize_event};
 use crate::native_hooks::{
     NATIVE_NON_GIT_OUTCOME, NATIVE_NORMALIZATION_OUTCOME_FIELD,
     incoming_event_from_native_hook_json,
@@ -595,7 +595,9 @@ fn parse_native_replay_timestamp(value: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp(unix_seconds).ok()
 }
 
-async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response::Response {
+async fn accept_event(state: &AppState, mut event: IncomingEvent) -> axum::response::Response {
+    enrich_correlated_lane_target(state, &mut event).await;
+
     let envelope = match from_incoming_event(&event) {
         Ok(envelope) => envelope,
         Err(error) => {
@@ -659,6 +661,69 @@ async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response:
                 .into_response()
         }
     }
+}
+
+async fn enrich_correlated_lane_target(state: &AppState, event: &mut IncomingEvent) {
+    if event.source_target.is_some() || !is_thread_notifiable_session_event(event.canonical_kind())
+    {
+        return;
+    }
+
+    let registry = state.tmux_registry.read().await;
+    let Some(registration) = find_correlated_tmux_registration(&registry, event) else {
+        return;
+    };
+    let Some(thread) = registration.thread.as_ref().map(String::as_str) else {
+        return;
+    };
+
+    event.source_target = Some(EventTargetHint::DiscordThread(thread.to_string()));
+}
+
+fn is_thread_notifiable_session_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "session.started"
+            | "session.blocked"
+            | "session.failed"
+            | "session.finished"
+            | "session.stopped"
+            | "session.pr-created"
+            | "session.prompt-delivery-failed"
+            | "session.retry-needed"
+            | "session.test-failed"
+            | "session.handoff-needed"
+    )
+}
+
+fn find_correlated_tmux_registration<'a>(
+    registry: &'a HashMap<String, RegisteredTmuxSession>,
+    event: &IncomingEvent,
+) -> Option<&'a RegisteredTmuxSession> {
+    for candidate in terminal_session_candidates(&event.payload) {
+        if let Some(registration) = registry.get(&candidate) {
+            return Some(registration);
+        }
+    }
+
+    let worktree = payload_string(&event.payload, &["/worktree_path", "/cwd", "/directory"])?;
+    let mut matches = registry.values().filter(|registration| {
+        registration
+            .routing
+            .worktree_path
+            .as_deref()
+            .is_some_and(|registered| registered == worktree)
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn payload_string<'a>(payload: &'a Value, pointers: &[&str]) -> Option<&'a str> {
+    pointers
+        .iter()
+        .find_map(|pointer| payload.pointer(pointer).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn local_only_event_response(
@@ -1033,6 +1098,7 @@ mod tests {
         RegisteredTmuxSession {
             session: session.into(),
             channel: Some("alerts".into()),
+            thread: None,
             mention: Some("<@123>".into()),
             routing: RoutingMetadata::default(),
             keywords: vec!["error".into()],
@@ -1144,6 +1210,7 @@ mod tests {
             IncomingEvent {
                 kind: "session.finished".into(),
                 channel: None,
+                source_target: None,
                 mention: None,
                 format: None,
                 template: None,
@@ -1191,6 +1258,7 @@ mod tests {
             IncomingEvent {
                 kind: "session.blocked".into(),
                 channel: None,
+                source_target: None,
                 mention: None,
                 format: None,
                 template: None,
@@ -1327,6 +1395,7 @@ mod tests {
         let event = IncomingEvent {
             kind: "tool.post".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1366,6 +1435,7 @@ mod tests {
         let event = IncomingEvent {
             kind: "tool.post".into(),
             channel: None,
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1445,6 +1515,7 @@ mod tests {
             IncomingEvent {
                 kind: "discord-watch.nudge-intent".into(),
                 channel: Some("must-not-route".into()),
+                source_target: None,
                 mention: None,
                 format: None,
                 template: None,
@@ -1500,6 +1571,7 @@ mod tests {
             IncomingEvent {
                 kind: "discord.message-create".into(),
                 channel: Some("dm".into()),
+                source_target: None,
                 mention: None,
                 format: None,
                 template: None,
@@ -1560,6 +1632,7 @@ mod tests {
             IncomingEvent {
                 kind: "discord.message-create".into(),
                 channel: Some("dm".into()),
+                source_target: None,
                 mention: None,
                 format: None,
                 template: None,
@@ -1616,6 +1689,7 @@ mod tests {
         let event = |id: &str| IncomingEvent {
             kind: "discord.message-create".into(),
             channel: Some("fixture-general".into()),
+            source_target: None,
             mention: None,
             format: None,
             template: None,
@@ -1831,6 +1905,144 @@ mod tests {
         assert_eq!(queued.payload["tool"], Value::from("codex"));
         assert_eq!(queued.payload["session_id"], Value::from("sess-65"));
         assert_eq!(queued.payload["event_id"], Value::from(event_id));
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_enriches_correlated_session_event_with_thread_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("forever-agent");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        let git = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .expect("git init");
+        assert!(git.status.success());
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        registry.write().await.insert(
+            "forever-agent-123".into(),
+            RegisteredTmuxSession {
+                session: "forever-agent-123".into(),
+                channel: None,
+                thread: Some("task-thread".into()),
+                mention: Some("<@walter>".into()),
+                routing: RoutingMetadata {
+                    repo_name: Some("forever-agent".into()),
+                    worktree_path: Some(repo.to_string_lossy().into_owned()),
+                    ..RoutingMetadata::default()
+                },
+                keywords: vec!["NARROW_DONE".into()],
+                keyword_window_secs: 30,
+                stale_minutes: 5,
+                format: Some(MessageFormat::Alert),
+                registered_at: "2026-06-04T00:00:00Z".into(),
+                registration_source: RegistrationSource::CliNew,
+                parent_process: None,
+                active_wrapper_monitor: false,
+            },
+        );
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: registry,
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+        let payload = json!({
+            "provider": "codex",
+            "event_name": "SessionStart",
+            "directory": repo,
+            "cwd": repo,
+            "event_payload": {
+                "session_id": "forever-agent-123",
+                "cwd": repo
+            }
+        });
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let queued = rx.recv().await.unwrap();
+        assert_eq!(queued.kind, "session.started");
+        assert_eq!(
+            queued.source_target,
+            Some(EventTargetHint::DiscordThread("task-thread".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn post_native_hook_does_not_thread_route_prompt_submitted_noise() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("forever-agent");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        let git = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .expect("git init");
+        assert!(git.status.success());
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        registry.write().await.insert(
+            "forever-agent-123".into(),
+            RegisteredTmuxSession {
+                session: "forever-agent-123".into(),
+                channel: None,
+                thread: Some("task-thread".into()),
+                mention: Some("<@walter>".into()),
+                routing: RoutingMetadata {
+                    repo_name: Some("forever-agent".into()),
+                    worktree_path: Some(repo.to_string_lossy().into_owned()),
+                    ..RoutingMetadata::default()
+                },
+                keywords: vec!["NARROW_DONE".into()],
+                keyword_window_secs: 30,
+                stale_minutes: 5,
+                format: Some(MessageFormat::Alert),
+                registered_at: "2026-06-04T00:00:00Z".into(),
+                registration_source: RegistrationSource::CliNew,
+                parent_process: None,
+                active_wrapper_monitor: false,
+            },
+        );
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: registry,
+            pending_update: update::new_shared_pending_update(),
+            native_observability: new_shared_native_hook_observability(),
+            cron_state_path: PathBuf::from("cron-state.json"),
+            discord_watch_lock: Arc::new(Mutex::new(())),
+        };
+        let payload = json!({
+            "provider": "codex",
+            "event_name": "UserPromptSubmit",
+            "directory": repo,
+            "cwd": repo,
+            "event_payload": {
+                "session_id": "forever-agent-123",
+                "cwd": repo,
+                "prompt": "Do routine work"
+            }
+        });
+
+        let response = post_native_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let queued = rx.recv().await.unwrap();
+        assert_eq!(queued.kind, "session.prompt-submitted");
+        assert_eq!(queued.source_target, None);
     }
 
     #[tokio::test]
@@ -2070,6 +2282,7 @@ mod tests {
             RegisteredTmuxSession {
                 session: "issue-105".into(),
                 channel: Some("alerts".into()),
+                thread: None,
                 mention: Some("<@123>".into()),
                 routing: RoutingMetadata::default(),
                 keywords: vec!["error".into()],

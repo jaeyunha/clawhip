@@ -368,6 +368,7 @@ pub fn incoming_event_from_native_hook_json(
     Ok(crate::events::IncomingEvent {
         kind: canonical_kind.to_string(),
         channel: None,
+        source_target: None,
         mention: None,
         format: None,
         template: None,

@@ -11,7 +11,7 @@ use crate::Result;
 use crate::events::MessageFormat;
 use crate::source::tmux::{RegisteredTmuxSession, RegistrationSource};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const DEFAULT_LEDGER_FILE: &str = "session-ledger.sqlite";
 
 pub fn default_ledger_path() -> PathBuf {
@@ -82,6 +82,7 @@ impl Ledger {
                 spawned_by_clawhip INTEGER NOT NULL DEFAULT 0,
                 expected_watch INTEGER NOT NULL DEFAULT 0,
                 state TEXT NOT NULL,
+                workflow_status TEXT NOT NULL DEFAULT 'active',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 last_seen_at TEXT
@@ -109,10 +110,37 @@ impl Ledger {
                 ON watch_intents(session_id);
             "#,
         )?;
+        self.ensure_column(
+            "sessions",
+            "workflow_status",
+            "TEXT NOT NULL DEFAULT 'active'",
+        )?;
+        self.conn.execute(
+            "UPDATE sessions SET workflow_status = 'retired' WHERE state = 'retired' AND workflow_status = 'active'",
+            [],
+        )?;
+        self.conn.execute(
+            "UPDATE sessions SET workflow_status = 'active' WHERE workflow_status IN ('failed', 'interrupted', 'abandoned')",
+            [],
+        )?;
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             params![SCHEMA_VERSION, now_rfc3339()],
         )?;
+        Ok(())
+    }
+
+    fn ensure_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        let mut statement = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !columns.iter().any(|existing| existing == column) {
+            self.conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -143,8 +171,8 @@ impl Ledger {
             r#"
             INSERT INTO sessions (
                 id, tmux_session, tmux_pane, kind, owner, project_path, repo_name, branch,
-                spawned_by_clawhip, expected_watch, state, created_at, updated_at, last_seen_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                spawned_by_clawhip, expected_watch, state, workflow_status, created_at, updated_at, last_seen_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             ON CONFLICT(tmux_session) DO UPDATE SET
                 tmux_pane = excluded.tmux_pane,
                 kind = excluded.kind,
@@ -152,9 +180,13 @@ impl Ledger {
                 project_path = excluded.project_path,
                 repo_name = excluded.repo_name,
                 branch = excluded.branch,
-                spawned_by_clawhip = excluded.spawned_by_clawhip,
+                spawned_by_clawhip = CASE
+                    WHEN sessions.spawned_by_clawhip != 0 OR excluded.spawned_by_clawhip != 0 THEN 1
+                    ELSE 0
+                END,
                 expected_watch = excluded.expected_watch,
                 state = excluded.state,
+                workflow_status = excluded.workflow_status,
                 updated_at = excluded.updated_at,
                 last_seen_at = excluded.last_seen_at
             "#,
@@ -170,6 +202,7 @@ impl Ledger {
                 input.spawned_by_clawhip,
                 input.expected_watch,
                 input.state.as_str(),
+                input.workflow_status.as_str(),
                 created_at,
                 now,
                 input.last_seen_at,
@@ -247,7 +280,7 @@ impl Ledger {
             .query_row(
                 r#"
                 SELECT id, tmux_session, tmux_pane, kind, owner, project_path, repo_name, branch,
-                       spawned_by_clawhip, expected_watch, state, created_at, updated_at, last_seen_at
+                       spawned_by_clawhip, expected_watch, state, workflow_status, created_at, updated_at, last_seen_at
                 FROM sessions
                 WHERE tmux_session = ?1
                 "#,
@@ -299,7 +332,7 @@ impl Ledger {
         let mut statement = self.conn.prepare(
             r#"
             SELECT id, tmux_session, tmux_pane, kind, owner, project_path, repo_name, branch,
-                   spawned_by_clawhip, expected_watch, state, created_at, updated_at, last_seen_at
+                   spawned_by_clawhip, expected_watch, state, workflow_status, created_at, updated_at, last_seen_at
             FROM sessions
             ORDER BY tmux_session
             "#,
@@ -322,8 +355,57 @@ impl Ledger {
             .ok_or_else(|| anyhow!("unknown session '{tmux_session}'").into())
     }
 
+    pub fn set_workflow_status(
+        &self,
+        tmux_session: &str,
+        workflow_status: WorkflowStatus,
+    ) -> Result<SessionRecord> {
+        self.conn.execute(
+            "UPDATE sessions SET workflow_status = ?1, updated_at = ?2 WHERE tmux_session = ?3",
+            params![workflow_status.as_str(), now_rfc3339(), tmux_session],
+        )?;
+        self.session_by_name(tmux_session)?
+            .ok_or_else(|| anyhow!("unknown session '{tmux_session}'").into())
+    }
+
     pub fn mark_ignored(&self, tmux_session: &str) -> Result<SessionRecord> {
         self.set_session_state(tmux_session, SessionState::IgnoredAlive)
+    }
+
+    pub fn complete_session(&self, tmux_session: &str) -> Result<SessionRecord> {
+        self.set_workflow_status(tmux_session, WorkflowStatus::Completed)
+    }
+
+    pub fn mark_needs_review(&self, tmux_session: &str) -> Result<SessionRecord> {
+        self.set_workflow_status(tmux_session, WorkflowStatus::NeedsReview)
+    }
+
+    pub fn mark_needs_qa(&self, tmux_session: &str) -> Result<SessionRecord> {
+        self.set_workflow_status(tmux_session, WorkflowStatus::NeedsQa)
+    }
+
+    pub fn mark_pr_open(&self, tmux_session: &str) -> Result<SessionRecord> {
+        self.set_workflow_status(tmux_session, WorkflowStatus::PrOpen)
+    }
+
+    pub fn mark_awaiting_ci(&self, tmux_session: &str) -> Result<SessionRecord> {
+        self.set_workflow_status(tmux_session, WorkflowStatus::AwaitingCi)
+    }
+
+    pub fn mark_awaiting_human(&self, tmux_session: &str) -> Result<SessionRecord> {
+        self.set_workflow_status(tmux_session, WorkflowStatus::AwaitingHuman)
+    }
+
+    pub fn cancel_session(&self, tmux_session: &str) -> Result<SessionRecord> {
+        self.set_workflow_status(tmux_session, WorkflowStatus::Cancelled)
+    }
+
+    pub fn supersede_session(&self, tmux_session: &str) -> Result<SessionRecord> {
+        self.set_workflow_status(tmux_session, WorkflowStatus::Superseded)
+    }
+
+    pub fn retire_session(&self, tmux_session: &str) -> Result<SessionRecord> {
+        self.set_workflow_status(tmux_session, WorkflowStatus::Retired)
     }
 }
 
@@ -336,7 +418,7 @@ pub enum LaneStatus {
     UnknownTmux,
     InfraCandidate,
     ExternallyWatched,
-    DeadSession,
+    TmuxMissing,
 }
 
 impl LaneStatus {
@@ -348,7 +430,87 @@ impl LaneStatus {
             Self::UnknownTmux => "unknown-tmux",
             Self::InfraCandidate => "infra-candidate",
             Self::ExternallyWatched => "externally-watched",
-            Self::DeadSession => "dead-session",
+            Self::TmuxMissing => "tmux-missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowStatus {
+    Active,
+    NeedsReview,
+    NeedsQa,
+    PrOpen,
+    AwaitingCi,
+    AwaitingHuman,
+    Completed,
+    Superseded,
+    Cancelled,
+    Retired,
+}
+
+impl WorkflowStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::NeedsReview => "needs-review",
+            Self::NeedsQa => "needs-qa",
+            Self::PrOpen => "pr-open",
+            Self::AwaitingCi => "awaiting-ci",
+            Self::AwaitingHuman => "awaiting-human",
+            Self::Completed => "completed",
+            Self::Superseded => "superseded",
+            Self::Cancelled => "cancelled",
+            Self::Retired => "retired",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Superseded | Self::Cancelled | Self::Retired
+        )
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "active" => Ok(Self::Active),
+            "needs-review" => Ok(Self::NeedsReview),
+            "needs-qa" => Ok(Self::NeedsQa),
+            "pr-open" => Ok(Self::PrOpen),
+            "awaiting-ci" => Ok(Self::AwaitingCi),
+            "awaiting-human" => Ok(Self::AwaitingHuman),
+            "completed" => Ok(Self::Completed),
+            "failed" | "interrupted" | "abandoned" => Ok(Self::Active),
+            "superseded" => Ok(Self::Superseded),
+            "cancelled" => Ok(Self::Cancelled),
+            "retired" => Ok(Self::Retired),
+            _ => Err(anyhow!("invalid workflow status '{value}'").into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeStatus {
+    Live,
+    TmuxMissing,
+}
+
+impl RuntimeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::TmuxMissing => "tmux-missing",
+        }
+    }
+
+    fn from_live_tmux(live_tmux: bool) -> Self {
+        if live_tmux {
+            Self::Live
+        } else {
+            Self::TmuxMissing
         }
     }
 }
@@ -357,6 +519,8 @@ impl LaneStatus {
 pub struct LaneRow {
     pub session: String,
     pub status: LaneStatus,
+    pub workflow_status: WorkflowStatus,
+    pub runtime_status: RuntimeStatus,
     pub kind: SessionKind,
     pub owner: SessionOwner,
     pub state: SessionState,
@@ -367,6 +531,7 @@ pub struct LaneRow {
     pub daemon_watch: bool,
     pub has_restore: bool,
     pub channel: Option<String>,
+    pub thread: Option<String>,
     pub repo_name: Option<String>,
     pub branch: Option<String>,
     pub restore_command: Option<String>,
@@ -392,6 +557,9 @@ pub fn classify_lanes(
 
     for session in ledger_sessions {
         known_sessions.insert(session.tmux_session.clone());
+        if session.workflow_status.is_terminal() || session.state == SessionState::Retired {
+            continue;
+        }
         let live_tmux = live_tmux_sessions.contains(&session.tmux_session);
         let daemon_registration = daemon_by_session
             .get(session.tmux_session.as_str())
@@ -404,6 +572,8 @@ pub fn classify_lanes(
         rows.push(LaneRow {
             session: session.tmux_session.clone(),
             status,
+            workflow_status: session.workflow_status,
+            runtime_status: RuntimeStatus::from_live_tmux(live_tmux),
             kind: session.kind,
             owner: session.owner,
             state: session.state,
@@ -418,6 +588,9 @@ pub fn classify_lanes(
                 .or_else(|| {
                     daemon_registration.and_then(|registration| registration.channel.clone())
                 }),
+            thread: intent.and_then(|intent| intent.thread.clone()).or_else(|| {
+                daemon_registration.and_then(|registration| registration.thread.clone())
+            }),
             repo_name: session.repo_name.clone(),
             branch: session.branch.clone(),
             restore_command: intent.map(WatchIntentRecord::restore_command_string),
@@ -432,6 +605,10 @@ pub fn classify_lanes(
         rows.push(LaneRow {
             session: registration.session.clone(),
             status: LaneStatus::ExternallyWatched,
+            workflow_status: WorkflowStatus::Active,
+            runtime_status: RuntimeStatus::from_live_tmux(
+                live_tmux_sessions.contains(&registration.session),
+            ),
             kind: SessionKind::Unknown,
             owner: SessionOwner::Unknown,
             state: SessionState::Healthy,
@@ -442,6 +619,7 @@ pub fn classify_lanes(
             daemon_watch: true,
             has_restore: false,
             channel: registration.channel.clone(),
+            thread: registration.thread.clone(),
             repo_name: registration.routing.repo_name.clone(),
             branch: registration.routing.branch.clone(),
             restore_command: None,
@@ -455,6 +633,8 @@ pub fn classify_lanes(
         rows.push(LaneRow {
             session: session.clone(),
             status: classify_unclaimed_tmux_session(session),
+            workflow_status: WorkflowStatus::Active,
+            runtime_status: RuntimeStatus::Live,
             kind: SessionKind::Unknown,
             owner: SessionOwner::Unknown,
             state: SessionState::Unknown,
@@ -465,6 +645,7 @@ pub fn classify_lanes(
             daemon_watch: false,
             has_restore: false,
             channel: None,
+            thread: None,
             repo_name: None,
             branch: None,
             restore_command: None,
@@ -481,7 +662,7 @@ fn classify_ledger_session(
     daemon_watch: bool,
 ) -> LaneStatus {
     if !live_tmux {
-        return LaneStatus::DeadSession;
+        return LaneStatus::TmuxMissing;
     }
     if session.state == SessionState::IgnoredAlive {
         return LaneStatus::IgnoredInfra;
@@ -585,6 +766,7 @@ pub enum SessionState {
     LostMonitoring,
     IgnoredAlive,
     Dead,
+    Retired,
 }
 
 impl SessionState {
@@ -595,6 +777,7 @@ impl SessionState {
             Self::LostMonitoring => "lost-monitoring",
             Self::IgnoredAlive => "ignored-alive",
             Self::Dead => "dead",
+            Self::Retired => "retired",
         }
     }
 
@@ -605,6 +788,7 @@ impl SessionState {
             "lost-monitoring" => Ok(Self::LostMonitoring),
             "ignored-alive" => Ok(Self::IgnoredAlive),
             "dead" => Ok(Self::Dead),
+            "retired" => Ok(Self::Retired),
             _ => Err(anyhow!("invalid session state '{value}'").into()),
         }
     }
@@ -622,6 +806,7 @@ pub struct SessionInput {
     pub spawned_by_clawhip: bool,
     pub expected_watch: bool,
     pub state: SessionState,
+    pub workflow_status: WorkflowStatus,
     pub last_seen_at: Option<String>,
 }
 
@@ -638,6 +823,7 @@ impl SessionInput {
             spawned_by_clawhip,
             expected_watch: true,
             state: SessionState::Unknown,
+            workflow_status: WorkflowStatus::Active,
             last_seen_at: Some(now_rfc3339()),
         }
     }
@@ -663,6 +849,7 @@ pub struct SessionRecord {
     pub spawned_by_clawhip: bool,
     pub expected_watch: bool,
     pub state: SessionState,
+    pub workflow_status: WorkflowStatus,
     pub created_at: String,
     pub updated_at: String,
     pub last_seen_at: Option<String>,
@@ -688,7 +875,7 @@ impl WatchIntentInput {
         Self {
             tmux_session: registration.session.clone(),
             channel: registration.channel.clone(),
-            thread: None,
+            thread: registration.thread.clone(),
             mention: registration.mention.clone(),
             keywords: registration.keywords.clone(),
             stale_minutes: registration.stale_minutes,
@@ -737,6 +924,9 @@ impl WatchIntentRecord {
         if let Some(channel) = &self.channel {
             args.extend(["--channel".to_string(), channel.clone()]);
         }
+        if let Some(thread) = &self.thread {
+            args.extend(["--thread".to_string(), thread.clone()]);
+        }
         if let Some(mention) = &self.mention {
             args.extend(["--mention".to_string(), mention.clone()]);
         }
@@ -766,6 +956,7 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     let kind: String = row.get(3)?;
     let owner: String = row.get(4)?;
     let state: String = row.get(10)?;
+    let workflow_status: String = row.get(11)?;
     Ok(SessionRecord {
         id: row.get(0)?,
         tmux_session: row.get(1)?,
@@ -778,9 +969,10 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         spawned_by_clawhip: row.get(8)?,
         expected_watch: row.get(9)?,
         state: SessionState::parse(&state).map_err(to_sql_dyn_error)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
-        last_seen_at: row.get(13)?,
+        workflow_status: WorkflowStatus::parse(&workflow_status).map_err(to_sql_dyn_error)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        last_seen_at: row.get(14)?,
     })
 }
 
@@ -878,6 +1070,7 @@ mod tests {
             spawned_by_clawhip: true,
             expected_watch: true,
             state: SessionState::Unknown,
+            workflow_status: WorkflowStatus::Active,
             last_seen_at: Some("2026-06-04T00:00:00Z".to_string()),
         }
     }
@@ -992,6 +1185,7 @@ mod tests {
         let registration = RegisteredTmuxSession {
             session: "agent-2".to_string(),
             channel: Some("channel-1".to_string()),
+            thread: None,
             mention: None,
             routing: RoutingMetadata {
                 repo_name: Some("forever-agent".to_string()),
@@ -1019,6 +1213,35 @@ mod tests {
         assert_eq!(session.repo_name.as_deref(), Some("forever-agent"));
         assert_eq!(intent.registration_source, RegistrationSource::CliNew);
         assert_eq!(intent.keywords, vec!["READY"]);
+    }
+
+    #[test]
+    fn cli_watch_reregistration_preserves_clawhip_spawn_provenance() {
+        let ledger = Ledger::open_memory().expect("ledger");
+        let initial_registration = registration("agent-reregistered");
+        let (session, _) = ledger
+            .record_registration(&initial_registration, true)
+            .expect("record initial clawhip spawn");
+
+        assert!(session.spawned_by_clawhip);
+
+        let mut watch_registration = registration("agent-reregistered");
+        watch_registration.registration_source = RegistrationSource::CliWatch;
+        watch_registration.keywords =
+            vec!["https://github.com/namuh-eng/opensend/pull/".to_string()];
+        watch_registration.thread = Some("thread-123".to_string());
+
+        let (session, intent) = ledger
+            .record_registration(&watch_registration, false)
+            .expect("record reregistration");
+
+        assert!(session.spawned_by_clawhip);
+        assert_eq!(intent.registration_source, RegistrationSource::CliWatch);
+        assert_eq!(
+            intent.keywords,
+            vec!["https://github.com/namuh-eng/opensend/pull/"]
+        );
+        assert_eq!(intent.thread.as_deref(), Some("thread-123"));
     }
 
     #[test]
@@ -1114,11 +1337,38 @@ mod tests {
         assert_eq!(statuses["manual"], LaneStatus::UnknownTmux);
         assert_eq!(statuses["ever-forever-agent"], LaneStatus::InfraCandidate);
         assert_eq!(statuses["external"], LaneStatus::ExternallyWatched);
-        assert_eq!(statuses["dead"], LaneStatus::DeadSession);
+        assert_eq!(statuses["dead"], LaneStatus::TmuxMissing);
     }
 
     #[test]
-    fn ignored_session_becomes_dead_when_tmux_disappears() {
+    fn terminal_sessions_are_hidden_from_lane_board() {
+        let ledger = Ledger::open_memory().expect("ledger");
+        for (name, workflow_status) in [
+            ("completed-review", WorkflowStatus::Completed),
+            ("cancelled-review", WorkflowStatus::Cancelled),
+            ("superseded-review", WorkflowStatus::Superseded),
+            ("retired-review", WorkflowStatus::Retired),
+        ] {
+            let mut input = sample_session_input(name);
+            input.workflow_status = workflow_status;
+            ledger.upsert_session(input).expect("session");
+            ledger
+                .upsert_watch_intent(sample_watch_input(name))
+                .expect("watch");
+        }
+
+        let rows = classify_lanes(
+            &ledger.sessions().unwrap(),
+            &ledger.watch_intents().unwrap(),
+            &[],
+            &BTreeSet::new(),
+        );
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn ignored_session_becomes_tmux_missing_when_tmux_disappears() {
         let ledger = Ledger::open_memory().expect("ledger");
         let mut ignored = sample_session_input("infra");
         ignored.expected_watch = false;
@@ -1132,13 +1382,36 @@ mod tests {
             &BTreeSet::new(),
         );
 
-        assert_eq!(rows[0].status, LaneStatus::DeadSession);
+        assert_eq!(rows[0].status, LaneStatus::TmuxMissing);
+    }
+
+    #[test]
+    fn record_registration_persists_thread_restore_target() {
+        let ledger = Ledger::open_memory().expect("ledger");
+        let mut registration = registration("agent-threaded");
+        registration.channel = None;
+        registration.thread = Some("thread-123".to_string());
+
+        let (_session, intent) = ledger
+            .record_registration(&registration, true)
+            .expect("registration");
+
+        assert_eq!(intent.channel, None);
+        assert_eq!(intent.thread.as_deref(), Some("thread-123"));
+        assert!(
+            intent
+                .restore_command_string()
+                .contains("--thread thread-123"),
+            "{}",
+            intent.restore_command_string()
+        );
     }
 
     fn registration(session: &str) -> RegisteredTmuxSession {
         RegisteredTmuxSession {
             session: session.to_string(),
             channel: Some("alerts".to_string()),
+            thread: None,
             mention: None,
             routing: RoutingMetadata::default(),
             keywords: vec!["READY".to_string()],
