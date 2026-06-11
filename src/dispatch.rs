@@ -365,6 +365,19 @@ impl Dispatcher {
             return;
         }
 
+        // The batch key groups deliveries by mention, so every item here shares
+        // the same one; prepend it once so batched events still wake the agent.
+        let mut content = contents.join("\n");
+        if let Some(mention) = first
+            .delivery
+            .mention
+            .as_deref()
+            .map(str::trim)
+            .filter(|mention| !mention.is_empty())
+        {
+            content = format!("{mention} {content}");
+        }
+
         self.emit_routine_flushed(first, contents.len());
         self.send_sink_message(
             sink.as_ref(),
@@ -372,7 +385,7 @@ impl Dispatcher {
             SinkMessage {
                 event_kind: "dispatch.routine-batched".to_string(),
                 format: first.delivery.format.clone(),
-                content: contents.join("\n"),
+                content,
                 payload: json!({
                     "batched": true,
                     "count": contents.len(),
@@ -1393,7 +1406,11 @@ mod tests {
 
         assert!(request.contains("tmux:issue-122 matched 'error' => first"));
         assert!(request.contains("tmux:issue-122 matched 'warn' => second"));
-        assert!(!request.contains("<@ops>"));
+        assert_eq!(
+            request.matches("<@ops>").count(),
+            1,
+            "batched delivery should carry the route mention exactly once"
+        );
     }
 
     #[tokio::test]
