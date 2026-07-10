@@ -449,6 +449,7 @@ pub enum LaneStatus {
     UnknownTmux,
     InfraCandidate,
     ExternallyWatched,
+    WorkflowHandoff,
     TmuxMissing,
 }
 
@@ -461,6 +462,7 @@ impl LaneStatus {
             Self::UnknownTmux => "unknown-tmux",
             Self::InfraCandidate => "infra-candidate",
             Self::ExternallyWatched => "externally-watched",
+            Self::WorkflowHandoff => "workflow-handoff",
             Self::TmuxMissing => "tmux-missing",
         }
     }
@@ -694,7 +696,11 @@ fn classify_ledger_session(
     daemon_watch: bool,
 ) -> LaneStatus {
     if !live_tmux {
-        return LaneStatus::TmuxMissing;
+        return if session.workflow_status == WorkflowStatus::Active {
+            LaneStatus::TmuxMissing
+        } else {
+            LaneStatus::WorkflowHandoff
+        };
     }
     if session.state == SessionState::IgnoredAlive {
         return LaneStatus::IgnoredInfra;
@@ -1439,6 +1445,31 @@ mod tests {
         assert_eq!(statuses["ever-forever-agent"], LaneStatus::InfraCandidate);
         assert_eq!(statuses["external"], LaneStatus::ExternallyWatched);
         assert_eq!(statuses["dead"], LaneStatus::TmuxMissing);
+    }
+
+    #[test]
+    fn missing_runtime_with_pending_workflow_is_a_handoff() {
+        let ledger = Ledger::open_memory().expect("ledger");
+        for (name, workflow_status) in [
+            ("review", WorkflowStatus::NeedsReview),
+            ("qa", WorkflowStatus::NeedsQa),
+            ("pr", WorkflowStatus::PrOpen),
+            ("ci", WorkflowStatus::AwaitingCi),
+            ("human", WorkflowStatus::AwaitingHuman),
+        ] {
+            let mut input = sample_session_input(name);
+            input.state = SessionState::Dead;
+            input.workflow_status = workflow_status;
+            ledger.upsert_session(input).expect("session");
+        }
+
+        let rows = classify_lanes(&ledger.sessions().unwrap(), &[], &[], &BTreeSet::new(), &[]);
+
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|row| {
+            row.status == LaneStatus::WorkflowHandoff
+                && row.runtime_status == RuntimeStatus::TmuxMissing
+        }));
     }
 
     #[test]
