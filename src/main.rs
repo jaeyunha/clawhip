@@ -312,7 +312,9 @@ async fn real_main(cli: Cli) -> Result<()> {
                         | ledger::LaneStatus::ExternallyWatched => ledger::SessionState::Healthy,
                         ledger::LaneStatus::LostMonitoring => ledger::SessionState::LostMonitoring,
                         ledger::LaneStatus::IgnoredInfra => ledger::SessionState::IgnoredAlive,
-                        ledger::LaneStatus::TmuxMissing => ledger::SessionState::Dead,
+                        ledger::LaneStatus::WorkflowHandoff | ledger::LaneStatus::TmuxMissing => {
+                            ledger::SessionState::Dead
+                        }
                         ledger::LaneStatus::UnknownTmux | ledger::LaneStatus::InfraCandidate => {
                             ledger::SessionState::Unknown
                         }
